@@ -1,0 +1,284 @@
+# ==============================================================================
+# 1. Environment & Packages
+# ==============================================================================
+.venv/
+env/
+venv/
+ENV/
+.python-version
+node_modules/
+.npm/
+*.local
+/__pycache__/
+# ==============================================================================
+# 2. Caches, Build & OS
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+# deploy/update.sh 的镜像构建状态目录（记录依赖签名，不入库）
+/.update/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.eslintcache
+.parcel-cache
+.vite/
+.npm-global/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+# 备份文件命名习惯不一：曾出现 config/runtime.env.bak-20260925（连字符）而旧规则
+# 只写 *.bak_*（下划线），导致含密钥的备份未被忽略、有被 git add . 提交的风险。
+# 统一用 *.bak* 覆盖 .bak / .bak_ / .bak- / .bak. 各种写法。
+*.bak*
+.project
+.pydevproject
+.settings/
+build/
+dist/
+*.egg-info/
+out/
+electron/dist/
+electron/out/
+.deploy_tmp/
+.deploy_fix/
+*.docker-build-lock
+.docker/
+.qwen
+.zcode
+.qoder
+# ==============================================================================
+# 3. AI, IDE & Local Tools
+# ==============================================================================
+.vscode/
+.idea/
+.trae/
+.codex/
+.codex_logs/
+.copilot/
+.gemini/
+.geminiignore
+.hintrc
+.traeignore
+.antigravityignore
+.workbuddy/
+.claude/settings.local.json
+
+# ==============================================================================
+# 4. Data, ML & Results
+# ==============================================================================
+logs/
+*.log
+# Databases
+*.duckdb
+*.duckdb.tmp/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Qlib & Large Data Files
+db/qlib_data/**/*.bin
+db/qlib_data/**/*.data
+!db/qlib_data/
+!db/qlib_data/**/
+!db/qlib_data/**/*.txt
+db/qlib_bin/
+db/qlib_csv/
+db/*.tar.gz
+db.tar.gz
+*.bin
+*.pkl
+*.parquet
+*.csv
+!backend/tests/**/*.csv
+!data/examples/**/*.csv
+data/backtest_results/
+data/alpha_agent_logs/
+userdata/
+research/data/
+research/data_adapter/qlib_data/
+research/data_adapter/processed/
+
+# Test Coverage Artifacts
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime user data
+user_pools_local/
+
+# Temp files
+tmp/
+temp/
+.temp/
+run/*.pid
+
+# ==============================================================================
+# 5. Secrets & Config
+# ==============================================================================
+.env
+.env.local
+.env.*.local
+!.env.example
+# 后台管理页面写入的运行时密钥
+config/runtime.env
+# 本地 compose 覆盖（deploy/enable-gpu.sh 生成的 GPU 直通等；机器本地状态）
+docker-compose.override.yml
+# 离线初始化包制作脚本（维护端本地工具，不入库；服务器侧备份在仓库外
+# /opt/quantmind-offline-build/make-offline-pkg.sh）
+deploy/make-offline-pkg.sh
+*.pem
+*.key
+.ssh/
+/db/*.sql
+!/db/sql/
+/db/sql/*
+!/db/sql/*.sql
+/redis
+/data/ai_ide/tmp_run
+/electron/icon.iconset
+# ==============================================================================
+# 5. Marketing Files
+# ==============================================================================
+marketing/
+# 视频配音/截图素材目录（本地制作产物，不入库）
+voiceover/
+
+# ==============================================================================
+# 6. Repository Specific Exceptions
+# ==============================================================================
+!.github/
+redis/data/appendonlydir/appendonly.aof.2.incr.aof
+# Windows specific build artifacts
+*.exe
+*.msi
+# 通达信交易桥 Windows 端（TDXBridge.exe）需要纳入版本管理
+!tools/bridge-windows/dist/TDXBridge.exe
+!tools/bridge-windows/dist/config.yaml
+
+# 桥运行时产物（日志/缓存/执行报告，不提交）
+tools/bridge-windows/data/
+tools/bridge-windows/execution_reports/
+.codegraph/
+/exports/
+
+# 运行时代码版本（deploy/update.sh 每次更新后生成，避免污染工作区）
+backend/shared/version.txt
+backend/shared/version.json
+electron/public/data/stocks.json
+electron/public/data/stocks/
+electron/public/fonts/AlibabaPuHuiTi-Bold.ttf
+electron/public/fonts/AlibabaPuHuiTi-Regular.ttf
+data/ai_ide/config.json
+db/diagram/postgresql_schema.dot
+db/backups/*.gz
+!db/feature_snapshots/*.json
+website/
+
+# Ignore db subdirectories
+/db/backups/
+/db/custom/
+/db/feature_snapshots/
+/db/qlib_data/
+/models/users/
+data/user_10000001
+db/csmar
+db20260528.tar.gz
+db/db.zip
+
+# Large data / model / experiment directories — too big for git
+/data/
+# 股票搜索索引：可由 build_stock_index.py 从 QuantDB 重建，但保留一份在仓库便于开箱即用
+!/data/
+/data/*
+!/data/stocks/
+# 数据库升级脚本：需入库，随版本新增（v1.0.N）
+!/data/upgrade_v*.sql
+/db/*
+!/db/sql/
+/db/sql/*
+!/db/sql/*.sql
+/models/
+/mlruns/
+/results/
+/results_v*/
+/log/
+# 注意：electron/src/data/ 是前端 TypeScript 源码目录（策略模板库），
+# 2026-05 曾被误当"数据目录"加入 ignore，导致任何新克隆的前端构建失败。
+# 已放行并入库，勿再次忽略。
+/.cache/
+/.venv*/
+/Untitled*.ipynb
+*.tar.gz
+*.deb
+*.h5
+*.hdf5
+
+# 本地/CDN 发布用离线镜像与 Qlib 数据包（体积较大，不纳入源码仓库）
+/images/
+
+docker/torch_wheels/
+
+# Graphify output
+graphify-out/
+.graphifyignore
+.graphifyignore_backup
+.graphifyignore_codeonly
+
+# GTJA 原始源码（外部参考，仅作公式对照，不入仓）
+scripts/data_repair/_gtja_191_source.py
+
+# 临时 / 分析 / 备份文件（不提交）
+analysis/
+openbb-cn/
+research/
+scratch/
+# 迁移约定：scratch/ 仅供一次性草稿/探测（丢弃区）。
+# 有沉淀价值的因子审计/校验脚本请移入 backend/scripts/audit/ 以纳入版本控制。
+dexter-finance/
+local_agent/
+examples/
+df_check.txt
+quantmind-新版/
+
+# CCASS 爬虫测试（配合本地未提交的爬虫改动，不入公共仓库）
+backend/services/tests/test_ccass_sync_resilience.py
+
+# PDF 字体冗余变体（脚本只用 WQYMicroHei/WQYZenHei/NotoSansCJK.ttf，
+# 这些 .ttc/SC 变体是同一字体的重复打包，100MB+ 不入仓）
+docker/training/fonts/*.ttc
+docker/training/fonts/NotoSansCJK-*.ttf
+docker/training/fonts/NotoSansCJKSC-*.ttf
+data/images/
+# models_share/*.tar.gz 不入库：模型不随源码分发（全局 *.tar.gz 规则已忽略）
+
+# 内部数据源爬虫（CCASS/北向/南向）——退出版本库，仅本地保留
+backend/scripts/ccass_*
+backend/scripts/hsgt_*crawler*.py
+backend/scripts/*north*.py
+backend/scripts/quanthk_*ccass*.py
+backend/scripts/quanthk_import_south.py
+backend/scripts/quanthk_south_sync.py
+
+# 本地信号因子生成器（内部资产）
+backend/scripts/build_ml_signal_datasets.py
+backend/scripts/evaluate_signal_factors.py
+
+# 内部发布脚本（含 COS 上传与 CDN 刷新，不进开源仓库）
+scripts/cos-publish/
+REFACTOR_PLAN.md
+
+# 训练节点配置（含 SSH 凭据，仅本地保留）
+config/training_nodes.yaml
+
+# 训练节点配置（含 SSH 凭据，仅本地保留）
+config/training_nodes.yaml
+
+# Windows 保留名残留文件（误重定向产生，不跟踪）
+/nul

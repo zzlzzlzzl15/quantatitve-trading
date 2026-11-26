@@ -1,0 +1,642 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from backend.shared.model_paths import (
+    models_fallback_production_dir,
+    models_production_dir,
+)
+from backend.shared.model_registry import model_registry_service
+
+from .script_runner import ExecutionResult, InferenceScriptRunner
+from .service import InferenceService
+
+logger = logging.getLogger(__name__)
+
+_NON_FEATURE_KEYS = {"symbol", "instrument", "timestamp", "datetime", "date"}
+_INDEPENDENT_MODEL_SOURCES = {
+    "explicit_model_id",
+    "strategy_binding",
+    "user_default",
+    "explicit_system_model",
+}
+
+
+def _build_execution_meta(
+    *,
+    fallback_used: bool,
+    fallback_reason: str,
+    active_model_id: str,
+    effective_model_id: str,
+    model_source: str,
+    independent_execution: bool | None = None,
+) -> dict[str, Any]:
+    if independent_execution is None:
+        independent_execution = model_source in _INDEPENDENT_MODEL_SOURCES
+
+    model_switch_used = bool(fallback_used) or (
+        bool(active_model_id)
+        and bool(effective_model_id)
+        and str(active_model_id) != str(effective_model_id)
+    )
+    return {
+        "execution_mode": (
+            "independent_model" if independent_execution else "system_chain"
+        ),
+        "model_switch_used": model_switch_used,
+        "model_switch_reason": (
+            str(fallback_reason or "") if model_switch_used else ""
+        ),
+    }
+
+
+def _get_model_data_dir(model_dir: Path) -> str:
+    """
+    从模型配置中获取推理数据目录。
+
+    优先级：
+    1. metadata.json 中的 qlib_data_path 字段（绝对路径）
+    2. metadata.json 中的 data_source 字段判断：
+       - "qlib" -> 通过 qlib_paths 解析（优先 QuantDB 缓存）
+       - "parquet" 或其他 -> db/feature_snapshots
+    3. 默认值 -> db/feature_snapshots
+    """
+    meta_file = Path(model_dir) / "metadata.json"
+    if meta_file.is_file():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            qlib_data_path = meta.get("qlib_data_path")
+            if qlib_data_path:
+                return qlib_data_path
+
+            data_source = str(meta.get("data_source", "")).lower()
+            if data_source == "quantdb_factors":
+                from backend.services.engine.inference.script_runner import (
+                    _resolve_market_factor_data_dir,
+                )
+                return _resolve_market_factor_data_dir(meta)
+            if data_source == "qlib":
+                from backend.shared.qlib_paths import resolve_qlib_provider_uri
+                return resolve_qlib_provider_uri()
+        except Exception:
+            pass
+
+    return "db/feature_snapshots"
+
+
+class InferenceRouterService:
+    """统一推理编排层：显式模型 / 策略绑定 / 用户默认模型。"""
+
+    def __init__(self, inference_service: InferenceService | None = None):
+        self.inference_service = inference_service or InferenceService()
+        self.primary_model_id = os.getenv("PRIMARY_MODEL_ID", "")
+        self.fallback_model_id = os.getenv("FALLBACK_MODEL_ID", "")
+        self.primary_model_dir = models_production_dir()
+        self.fallback_model_dir = models_fallback_production_dir()
+        self.primary_data_source = os.getenv("QLIB_PRIMARY_DATA_PATH", "db/feature_snapshots")
+        self.fallback_data_source = os.getenv("QLIB_FALLBACK_DATA_PATH", "db/qlib_data")
+
+    def _resolve_data_source(self, model_id: str, model_source: str = "") -> str:
+        if model_id == self.fallback_model_id:
+            return self.fallback_data_source
+        if model_source in {"explicit_model_id", "strategy_binding", "user_default"}:
+            return "user_model_registry"
+        return self.primary_data_source
+
+    async def resolve_effective_model(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        strategy_id: str | None = None,
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
+        resolved = await model_registry_service.resolve_effective_model(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            strategy_id=strategy_id,
+            model_id=model_id,
+        )
+        return resolved.to_dict()
+
+    def _finalize(
+        self,
+        *,
+        raw: dict[str, Any],
+        fallback_used: bool,
+        fallback_reason: str,
+        active_model_id: str,
+        active_data_source: str,
+        trace_id: str | None,
+        model_source: str,
+        effective_model_id: str,
+        independent_execution: bool | None = None,
+    ) -> dict[str, Any]:
+        result = self._enrich_result(
+            raw,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            active_model_id=active_model_id,
+            active_data_source=active_data_source,
+            model_source=model_source,
+            effective_model_id=effective_model_id,
+            independent_execution=independent_execution,
+        )
+        logger.info(
+            "[InferenceRouter] trace_id=%s active_model_id=%s effective_model_id=%s source=%s fallback_used=%s fallback_reason=%s status=%s",
+            trace_id or "n/a",
+            result.get("active_model_id"),
+            result.get("effective_model_id"),
+            result.get("model_source"),
+            result.get("fallback_used"),
+            result.get("fallback_reason") or "",
+            result.get("status"),
+        )
+        return result
+
+    def _expected_feature_dim(self, model_id: str, *, model_dir: Path | None = None) -> int:
+        meta = self.inference_service.model_loader.get_model_metadata(model_id, model_dir=model_dir) or {}
+        feature_cols = meta.get("feature_columns")
+        if isinstance(feature_cols, list) and feature_cols:
+            return len(feature_cols)
+        input_spec = meta.get("input_spec")
+        if isinstance(input_spec, dict):
+            tensor_shape = input_spec.get("tensor_shape")
+            if isinstance(tensor_shape, list) and len(tensor_shape) >= 3:
+                try:
+                    return int(tensor_shape[2] or 0)
+                except Exception:
+                    return 0
+        return 0
+
+    @staticmethod
+    def _input_feature_dim(data: dict[str, Any] | list[dict[str, Any]]) -> int:
+        if isinstance(data, dict) and isinstance(data.get("sequences"), list):
+            seqs = data.get("sequences") or []
+            if seqs and isinstance(seqs[0], list) and seqs[0] and isinstance(seqs[0][0], list):
+                return int(len(seqs[0][0]))
+            return 0
+
+        rows: list[dict[str, Any]]
+        if isinstance(data, dict):
+            rows = [data]
+        elif isinstance(data, list):
+            rows = [item for item in data if isinstance(item, dict)]
+        else:
+            return 0
+
+        feature_keys = set()
+        for row in rows:
+            feature_keys.update(str(k) for k in row.keys())
+        feature_keys -= _NON_FEATURE_KEYS
+        return len(feature_keys)
+
+    def _dimension_gate(
+        self,
+        model_id: str,
+        data: dict[str, Any] | list[dict[str, Any]],
+        *,
+        model_dir: Path | None = None,
+    ) -> tuple[bool, str]:
+        expected_dim = self._expected_feature_dim(model_id, model_dir=model_dir)
+        if expected_dim <= 0:
+            return True, "expected_dim_unknown"
+        actual_dim = self._input_feature_dim(data)
+        passed = actual_dim >= expected_dim
+        return passed, f"expected_dim={expected_dim}, actual_dim={actual_dim}"
+
+    @staticmethod
+    def _enrich_result(
+        raw: dict[str, Any],
+        *,
+        fallback_used: bool,
+        fallback_reason: str,
+        active_model_id: str,
+        active_data_source: str,
+        model_source: str,
+        effective_model_id: str,
+        independent_execution: bool | None = None,
+    ) -> dict[str, Any]:
+        result = dict(raw or {})
+        execution_meta = _build_execution_meta(
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            active_model_id=active_model_id,
+            effective_model_id=effective_model_id,
+            model_source=model_source,
+            independent_execution=independent_execution,
+        )
+        result["fallback_used"] = bool(fallback_used)
+        result["fallback_reason"] = str(fallback_reason or "")
+        result["execution_mode"] = execution_meta["execution_mode"]
+        result["model_switch_used"] = execution_meta["model_switch_used"]
+        result["model_switch_reason"] = execution_meta["model_switch_reason"]
+        result["active_model_id"] = str(active_model_id)
+        result["active_data_source"] = str(active_data_source)
+        result["model_source"] = str(model_source or "")
+        result["effective_model_id"] = str(effective_model_id or active_model_id)
+        return result
+
+    def _predict_single_model(
+        self,
+        *,
+        model_id: str,
+        data: dict[str, Any] | list[dict[str, Any]],
+        model_dir: str | None = None,
+        cache_namespace: str | None = None,
+    ) -> dict[str, Any]:
+        model_path = Path(model_dir) if model_dir else None
+        return self.inference_service.predict(
+            model_id,
+            data,
+            model_dir=model_path,
+            cache_namespace=cache_namespace,
+        )
+
+    def _predict_system_chain(
+        self,
+        *,
+        model_id: str,
+        data: dict[str, Any] | list[dict[str, Any]],
+        trace_id: str | None = None,
+        model_source: str = "system_fallback",
+        effective_model_id: str | None = None,
+    ) -> dict[str, Any]:
+        effective_mid = str(effective_model_id or model_id or self.primary_model_id)
+        requested_model = str(model_id or self.primary_model_id)
+
+        if requested_model != self.primary_model_id:
+            primary = self._predict_single_model(model_id=requested_model, data=data)
+            return self._finalize(
+                raw=primary,
+                fallback_used=False,
+                fallback_reason="",
+                active_model_id=requested_model,
+                active_data_source=self._resolve_data_source(requested_model, model_source=model_source),
+                trace_id=trace_id,
+                model_source=model_source,
+                effective_model_id=effective_mid,
+                independent_execution=requested_model != self.primary_model_id,
+            )
+
+        dim_ready, dim_detail = self._dimension_gate(requested_model, data)
+        if not dim_ready:
+            fallback = self._predict_single_model(model_id=self.fallback_model_id, data=data)
+            if fallback.get("status") == "success":
+                return self._finalize(
+                    raw=fallback,
+                    fallback_used=True,
+                    fallback_reason=f"主模型维度门禁未通过: {dim_detail}",
+                    active_model_id=self.fallback_model_id,
+                    active_data_source=self.fallback_data_source,
+                    trace_id=trace_id,
+                    model_source=model_source,
+                    effective_model_id=effective_mid,
+                    independent_execution=False,
+                )
+            return self._finalize(
+                raw=fallback,
+                fallback_used=True,
+                fallback_reason=f"主模型维度门禁未通过且兜底失败: {dim_detail}",
+                active_model_id=self.fallback_model_id,
+                active_data_source=self.fallback_data_source,
+                trace_id=trace_id,
+                model_source=model_source,
+                effective_model_id=effective_mid,
+                independent_execution=False,
+            )
+
+        primary = self._predict_single_model(model_id=requested_model, data=data)
+        if primary.get("status") == "success":
+            return self._finalize(
+                raw=primary,
+                fallback_used=False,
+                fallback_reason="",
+                active_model_id=self.primary_model_id,
+                active_data_source=self.primary_data_source,
+                trace_id=trace_id,
+                model_source=model_source,
+                effective_model_id=effective_mid,
+                independent_execution=False,
+            )
+
+        fallback = self._predict_single_model(model_id=self.fallback_model_id, data=data)
+        if fallback.get("status") == "success":
+            return self._finalize(
+                raw=fallback,
+                fallback_used=True,
+                fallback_reason=f"主模型推理失败: {primary.get('error', 'unknown')}",
+                active_model_id=self.fallback_model_id,
+                active_data_source=self.fallback_data_source,
+                trace_id=trace_id,
+                model_source=model_source,
+                effective_model_id=effective_mid,
+                independent_execution=False,
+            )
+
+        return self._finalize(
+            raw=fallback,
+            fallback_used=True,
+            fallback_reason=(
+                f"主模型推理失败且兜底失败: primary={primary.get('error', 'unknown')}; "
+                f"fallback={fallback.get('error', 'unknown')}"
+            ),
+            active_model_id=self.fallback_model_id,
+            active_data_source=self.fallback_data_source,
+            trace_id=trace_id,
+            model_source=model_source,
+            effective_model_id=effective_mid,
+            independent_execution=False,
+        )
+
+    def predict_with_fallback(
+        self,
+        model_id: str,
+        data: dict[str, Any] | list[dict[str, Any]],
+        *,
+        trace_id: str | None = None,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+        strategy_id: str | None = None,
+    ) -> dict[str, Any]:
+        requested_model_id = str(model_id or "").strip() or self.primary_model_id
+        if tenant_id and user_id:
+            try:
+                asyncio.get_running_loop()
+                raise RuntimeError("predict_with_fallback must use async API when tenant_id/user_id are provided")
+            except RuntimeError as loop_err:
+                if "must use async API" in str(loop_err):
+                    raise
+            resolved = model_registry_service.resolve_effective_model_sync(
+                tenant_id=str(tenant_id),
+                user_id=str(user_id),
+                strategy_id=strategy_id,
+                model_id=requested_model_id or None,
+            )
+            return self._predict_with_resolved(
+                requested_model_id=requested_model_id,
+                resolved=resolved,
+                data=data,
+                trace_id=trace_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+
+        return self._predict_system_chain(
+            model_id=requested_model_id,
+            data=data,
+            trace_id=trace_id,
+            model_source="legacy_request",
+            effective_model_id=requested_model_id,
+        )
+
+    async def predict_with_fallback_async(
+        self,
+        model_id: str,
+        data: dict[str, Any] | list[dict[str, Any]],
+        *,
+        tenant_id: str,
+        user_id: str,
+        strategy_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        requested_model_id = str(model_id or "").strip() or self.primary_model_id
+        resolved = await self.resolve_effective_model(
+            tenant_id=str(tenant_id),
+            user_id=str(user_id),
+            strategy_id=strategy_id,
+            model_id=requested_model_id or None,
+        )
+        return self._predict_with_resolved(
+            requested_model_id=requested_model_id,
+            resolved=resolved,
+            data=data,
+            trace_id=trace_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+
+    def _predict_with_resolved(
+        self,
+        *,
+        requested_model_id: str,
+        resolved: dict[str, Any],
+        data: dict[str, Any] | list[dict[str, Any]],
+        trace_id: str | None,
+        tenant_id: str,
+        user_id: str,
+    ) -> dict[str, Any]:
+        effective_model_id = str(resolved.get("effective_model_id") or self.primary_model_id)
+        model_source = str(resolved.get("model_source") or "")
+        storage_path = str(resolved.get("storage_path") or "").strip()
+        fallback_reason = str(resolved.get("fallback_reason") or "").strip()
+        fallback_used = bool(resolved.get("fallback_used"))
+
+        if storage_path and Path(storage_path).exists() and model_source in {
+            "explicit_model_id",
+            "strategy_binding",
+            "user_default",
+        }:
+            user_result = self._predict_single_model(
+                model_id=effective_model_id,
+                data=data,
+                model_dir=storage_path,
+                cache_namespace=f"{tenant_id}:{user_id}",
+            )
+            if user_result.get("status") == "success":
+                return self._finalize(
+                    raw=user_result,
+                    fallback_used=fallback_used,
+                    fallback_reason=fallback_reason,
+                    active_model_id=effective_model_id,
+                    active_data_source=self._resolve_data_source(effective_model_id, model_source=model_source),
+                    trace_id=trace_id,
+                    model_source=model_source,
+                    effective_model_id=effective_model_id,
+                    independent_execution=True,
+                )
+
+            chain_reason = (
+                f"user_model_failed={user_result.get('error', 'unknown')}; "
+                f"{fallback_reason or 'fallback to system chain'}"
+            ).strip()
+            result = self._predict_system_chain(
+                model_id=self.primary_model_id,
+                data=data,
+                trace_id=trace_id,
+                model_source=model_source or "system_fallback",
+                effective_model_id=effective_model_id,
+            )
+            result["fallback_reason"] = chain_reason
+            return result
+
+        if model_source in {"explicit_model_id", "strategy_binding", "user_default"}:
+            chain_model = self.primary_model_id
+        else:
+            chain_model = effective_model_id or requested_model_id
+
+        return self._predict_system_chain(
+            model_id=chain_model,
+            data=data,
+            trace_id=trace_id,
+            model_source=model_source or "system_fallback",
+            effective_model_id=effective_model_id,
+        )
+
+    def run_daily_inference_script(
+        self,
+        *,
+        date: str,
+        tenant_id: str,
+        user_id: str,
+        strategy_id: str | None = None,
+        model_id: str | None = None,
+        resolved_model: dict[str, Any] | None = None,
+        redis_client=None,
+        symbols: list[str] | None = None,
+        persist: bool = True,
+        pool_id: str | None = None,
+    ) -> ExecutionResult:
+        if resolved_model is not None:
+            resolved = dict(resolved_model)
+        else:
+            resolved = model_registry_service.resolve_effective_model_sync(
+                tenant_id=str(tenant_id),
+                user_id=str(user_id),
+                strategy_id=str(strategy_id) if strategy_id is not None else None,
+                model_id=model_id,
+            )
+        effective_model_id = str(resolved.get("effective_model_id") or self.primary_model_id)
+        model_source = str(resolved.get("model_source") or "")
+        storage_path = str(resolved.get("storage_path") or "").strip()
+        fallback_reason = str(resolved.get("fallback_reason") or "")
+
+        explicit_storage_dir = storage_path if storage_path and Path(storage_path).exists() else ""
+        independent_execution = (
+            model_source in _INDEPENDENT_MODEL_SOURCES
+            or effective_model_id == self.fallback_model_id
+        )
+
+        if explicit_storage_dir:
+            primary_dir = explicit_storage_dir
+            primary_id = effective_model_id
+            primary_data_dir = _get_model_data_dir(Path(primary_dir))
+        elif effective_model_id == self.fallback_model_id:
+            primary_dir = self.fallback_model_dir
+            primary_id = self.fallback_model_id
+            primary_data_dir = _get_model_data_dir(Path(primary_dir))
+        else:
+            primary_dir = self.primary_model_dir
+            primary_id = self.primary_model_id
+            primary_data_dir = self.primary_data_source
+
+        if independent_execution:
+            fallback_dir = primary_dir
+            fallback_id = primary_id
+            fallback_data_dir = primary_data_dir
+        else:
+            fallback_dir = (
+                self.primary_model_dir
+                if primary_id != self.primary_model_id
+                else self.fallback_model_dir
+            )
+            fallback_id = (
+                self.primary_model_id
+                if primary_id != self.primary_model_id
+                else self.fallback_model_id
+            )
+            fallback_data_dir = (
+                self.fallback_data_source
+                if fallback_id == self.fallback_model_id
+                else primary_data_dir
+            )
+
+        runner = InferenceScriptRunner(
+            primary_model_dir=primary_dir,
+            fallback_model_dir=fallback_dir,
+            primary_data_dir=primary_data_dir,
+            fallback_data_dir=fallback_data_dir,
+            primary_model_id=primary_id,
+            fallback_model_id=fallback_id,
+            enable_fallback=not independent_execution,
+        )
+        result = runner.execute(date, tenant_id=tenant_id, user_id=user_id, redis_client=redis_client, symbols=symbols, persist=persist, pool_id=pool_id)
+        execution_meta = _build_execution_meta(
+            fallback_used=bool(result.fallback_used),
+            fallback_reason=result.fallback_reason or fallback_reason,
+            active_model_id=result.active_model_id,
+            effective_model_id=effective_model_id,
+            model_source=model_source,
+            independent_execution=independent_execution,
+        )
+        result.execution_mode = str(execution_meta["execution_mode"])
+        result.model_switch_used = bool(execution_meta["model_switch_used"])
+        result.model_switch_reason = str(execution_meta["model_switch_reason"])
+
+        # 两套推理数据一致性：用户模型全市场推理成功后，把真实分数回写
+        # 该模型目录的 pred.parquet（coverage 缺口判定与个股分数曲线的
+        # 数据源）。单股推理（symbols 非空，仅个别标的）、股票池推理
+        # （pool_id 非空，仅池内截面）与兜底结果不回写，避免残缺日期
+        # 污染历史分数序列；persist=False（个股独立轻路线）同样不回写，
+        # 结果只在前端缓存。
+        _pool_scoped = bool(str(pool_id or "").strip())
+        if (
+            result.success
+            and persist
+            and not result.fallback_used
+            and explicit_storage_dir
+            and symbols is None
+            and not _pool_scoped
+            and getattr(result, "signals", None)
+        ):
+            try:
+                from backend.services.engine.inference.pred_merge import (
+                    merge_signals_into_pred,
+                )
+
+                pred_file = Path(primary_dir) / "pred.parquet"
+                pred_existed = pred_file.is_file()
+                merged = merge_signals_into_pred(
+                    pred_file,
+                    [(str(date), list(result.signals))],
+                    create_if_missing=True,
+                )
+                if merged and not pred_existed:
+                    # 模型目录原本没有 pred.parquet（模型广场导入包不含该产物、
+                    # 或训练产物丢失）：旧行为是静默返回 0，于是推理「跑了但文件
+                    # 永远不出现」，模拟交易回放建会话被 pred.parquet 门禁永久拦死
+                    # （simulation/replay/router.py 报「模型缺少 pred.parquet」）。
+                    # 现在用本次单日分数建文件，先让下游可用；历史分数需「一键补全」。
+                    logger.warning(
+                        "[InferenceRouter] %s 原本缺少 pred.parquet，"
+                        "已用 %s 的单日分数新建（历史分数请走「一键补全至最新」）",
+                        primary_dir,
+                        date,
+                    )
+                elif merged:
+                    logger.info(
+                        "[InferenceRouter] 已回写 %s 行分数到 %s",
+                        merged,
+                        pred_file,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[InferenceRouter] pred.parquet 回写失败（信号已落库，忽略）: %s",
+                    exc,
+                )
+
+        # 系统内置 model_qlib/alpha158 兜底链已废弃：用户模型失败时不再补位。
+        if result.success and model_source in _INDEPENDENT_MODEL_SOURCES:
+            result.active_model_id = effective_model_id
+            if (
+                not independent_execution
+                and fallback_reason
+                and not result.fallback_reason
+            ):
+                result.fallback_reason = fallback_reason
+        return result

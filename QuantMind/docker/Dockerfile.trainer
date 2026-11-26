@@ -1,0 +1,86 @@
+# QuantMind Standalone Trainer Image
+# 专用于模型训练的独立精简镜像 (支持本地 GPU / AutoDL / 远程算力节点)
+
+FROM python:3.10-slim-bookworm
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG TORCH_DEVICE=gpu
+ARG TORCH_CPU_INDEX_URL=https://mirrors.aliyun.com/pytorch-wheels/cpu
+ARG TORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu128
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST} \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# 配置 APT 镜像源并安装编译依赖与 OpenMP 支持
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i "s/deb.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s/security.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list.d/debian.sources; \
+    else \
+      sed -i "s/deb.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list; \
+      sed -i "s/security.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 PyTorch 与核心训练依赖
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    if [ "$TORCH_DEVICE" = "cpu" ]; then \
+      # torch 本体走 PyTorch 官方 CPU 源，依赖包仍走默认索引（阿里云）
+      pip install --no-cache-dir --root-user-action=ignore --no-deps torch torchvision torchaudio --index-url ${TORCH_CPU_INDEX_URL}; \
+      pip install --no-cache-dir --root-user-action=ignore torch torchvision torchaudio; \
+    else \
+      # 用 --extra-index-url 仅让 torch 本体走 cu128 源，传递依赖仍走默认索引（阿里云）
+      pip install --no-cache-dir --root-user-action=ignore \
+        "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
+        --extra-index-url ${TORCH_CUDA_INDEX_URL}; \
+    fi
+
+RUN pip install --no-cache-dir --root-user-action=ignore \
+      numpy \
+      pandas \
+      pyarrow \
+      scipy \
+      scikit-learn \
+      lightgbm \
+      xgboost \
+      catboost \
+      optuna \
+      pyyaml \
+      requests \
+      psutil \
+      shap \
+      duckdb \
+      pyqlib
+
+# 拷贝后端包（QuantDB 因子直读等训练依赖 backend 模块）
+COPY backend /app/backend
+
+# 拷贝训练脚本及预处理函数
+COPY docker/training/train.py /app/train.py
+COPY docker/training/preprocessing.py /app/preprocessing.py
+COPY docker/training/model_trainers /app/model_trainers
+COPY docker/training/diagnostics /app/diagnostics
+COPY docker/training/data /app/data
+
+# 预创建挂载目录
+RUN mkdir -p /workspace /data/features /data/quantdb /app/models /tmp
+
+VOLUME ["/workspace", "/data/features", "/data/quantdb", "/app/models"]
+
+ENTRYPOINT ["python", "/app/train.py"]
+CMD ["--config", "/workspace/config.yaml"]

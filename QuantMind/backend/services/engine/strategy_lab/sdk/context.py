@@ -1,0 +1,933 @@
+"""Context — the single object passed to setup / on_universe / on_bar.
+
+This is the user-facing API surface. The Day-1 version implements the
+attribute model + parameter declarations + recording of orders and risk
+rules; the actual broker / data layer lives in runner/* and engine/*
+(Days 2-3). User code that only references the SDK never imports those
+internals, which is what lets us swap engines later.
+
+Spec: §4 of docs/Strategy_Lab规范.md.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+from collections.abc import Callable, Iterable, Sequence
+
+import pandas as pd
+
+from backend.shared.stock_pool.builtins import BUILTIN_CODES
+
+from .position import Position
+
+# ---------------------------------------------------------------------------
+# Attribute schema — declared centrally so we can validate user code.
+# ---------------------------------------------------------------------------
+# P2：股票池白名单由 shared.stock_pool.builtins 派生（唯一事实源）。
+# 改造前这里硬编码 8 个池，与 quantdb_hub.UNIVERSE_MAP 不一致
+# （多了 hs300_ext/hk_main/us_sp500，少了 sse50/gem/star），
+# 导致「SDK 能写、回测解析静默查空」。现在两边同源。
+_ALLOWED_UNIVERSES: frozenset[str] = frozenset(BUILTIN_CODES)
+_ALLOWED_EXECUTION_MODELS: frozenset[str] = frozenset({"a_share_strict", "simple"})
+_ALLOWED_ENGINES: frozenset[str] = frozenset({"qlib"})
+
+_DEFAULTS: dict[str, Any] = {
+    "universe": None,
+    # 策略股票池（P5）：一行代码限定范围，如 ctx.stock_pool = "pool:csi1000"。
+    # 语义为 universe ∩ 股票池；None/all 时不过滤。解析入口与模拟盘共用
+    # backend.shared.stock_pool.strategy.apply_pool_to_universe。
+    "stock_pool": None,
+    "start": None,
+    "end": None,
+    "cash": None,
+    # 基准指数：后缀正典（000300.SH）；Qlib 边界经 benchmark_symbol.normalize
+    # 转小写 qlib 形（sh000300），to_qlib 同理接受后缀。
+    "benchmark": "000300.SH",
+    "commission": 0.0003,
+    "slippage": 0.0005,
+    "tax_sell": 0.0005,
+    "transfer_fee": 0.00001,
+    "execution_model": "a_share_strict",
+    "max_position_per_stock": 0.10,
+    "max_positions": 10,
+    "engine": "qlib",
+    "freq": "day",
+}
+
+
+def _coerce_date(val: Any) -> pd.Timestamp:
+    if isinstance(val, pd.Timestamp):
+        return val
+    if isinstance(val, datetime):
+        return pd.Timestamp(val)
+    return pd.Timestamp(str(val))
+
+
+# ---------------------------------------------------------------------------
+# Order / risk records — the runner consumes these.
+# ---------------------------------------------------------------------------
+@dataclass
+class OrderIntent:
+    symbol: str
+    side: str  # "buy" / "sell" / "set_position" / "set_target_holdings"
+    weight: float | None = None
+    qty: int | None = None
+    all: bool = False
+    targets: list[str] = field(default_factory=list)
+    target_weight_mode: str = "equal"
+    reason: str = ""
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RiskRule:
+    symbol: str | None
+    kind: str  # "stop_loss" / "take_profit" / "account_stop_loss" / "max_holding_days"
+    value: float | int
+
+
+@dataclass
+class ParamSpec:
+    name: str
+    choices: list[Any]
+    default: Any
+
+
+@dataclass
+class StatsView:
+    n_trades: int = 0
+    n_buy: int = 0
+    n_sell: int = 0
+    cum_return: float = 0.0
+    max_drawdown: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Context
+# ---------------------------------------------------------------------------
+class Context:
+    """The single object passed to setup / on_bar / on_universe.
+
+    Day-1 scope: attributes + parameter declaration + order/risk recording +
+    log/plot collection. The data layer (history/feature/snapshot) and broker
+    layer (buy/sell execution) raise NotImplementedError until wired by the
+    runner — tests inject stubs.
+    """
+
+    # Slots-ish: declare allowed runtime fields explicitly. We DON'T use
+    # __slots__ because user code may stash bookkeeping on ctx; instead we
+    # validate writes through __setattr__ for the "config" attributes only.
+
+    _CONFIG_KEYS: frozenset[str] = frozenset(_DEFAULTS.keys())
+    _RESERVED_KEYS: frozenset[str] = frozenset(
+        {
+            "_params",
+            "_param_values",
+            "_orders",
+            "_risk_rules",
+            "_logs",
+            "_plot_lines",
+            "_plot_markers",
+            "_positions",
+            "_equity",
+            "_today",
+            "_data_provider",
+            "_broker",
+            "_now_index",
+            "_dirty",
+            "_drawn_lines",
+            "_pattern_pending",
+            "_pattern_state",
+            "stats",
+        }
+    )
+
+    def __init__(self) -> None:
+        # Use object.__setattr__ to bypass our own validation hook.
+        for k, v in _DEFAULTS.items():
+            object.__setattr__(self, k, v)
+
+        object.__setattr__(self, "_params", {})  # name -> ParamSpec
+        object.__setattr__(self, "_param_values", {})  # name -> current value
+        object.__setattr__(self, "_orders", [])
+        object.__setattr__(self, "_risk_rules", [])
+        object.__setattr__(self, "_logs", [])
+        object.__setattr__(self, "_plot_lines", [])
+        object.__setattr__(self, "_plot_markers", [])
+        object.__setattr__(self, "_positions", {})  # symbol -> Position
+        object.__setattr__(self, "_equity", 0.0)
+        object.__setattr__(self, "_today", None)
+        object.__setattr__(self, "_data_provider", None)
+        object.__setattr__(self, "_broker", None)
+        object.__setattr__(self, "_now_index", 0)
+        object.__setattr__(self, "_dirty", False)
+        object.__setattr__(self, "_drawn_lines", {})
+        object.__setattr__(self, "_pattern_pending", {})  # "side:symbol" -> 挂起信号
+        object.__setattr__(self, "_pattern_state", {})  # "side:symbol" -> 上次是否命中
+        object.__setattr__(self, "stats", StatsView())
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+    def __setattr__(self, key: str, value: Any) -> None:
+        if key in self._CONFIG_KEYS:
+            self._validate_config(key, value)
+            object.__setattr__(self, key, value)
+            object.__setattr__(self, "_dirty", True)
+            return
+        if key in self._RESERVED_KEYS:
+            object.__setattr__(self, key, value)
+            return
+        # User scratch space — allowed, but discourage by name conflict.
+        object.__setattr__(self, key, value)
+
+    @staticmethod
+    def _validate_config(key: str, value: Any) -> None:
+        if value is None:
+            return
+        if key == "universe":
+            if isinstance(value, str):
+                if value not in _ALLOWED_UNIVERSES:
+                    raise ValueError(
+                        f"universe='{value}' not supported. "
+                        f"choose from {sorted(_ALLOWED_UNIVERSES)} or pass list[str]."
+                    )
+            elif isinstance(value, (list, tuple, set)):
+                if not all(isinstance(s, str) and s for s in value):
+                    raise ValueError("universe list must contain non-empty strings")
+            else:
+                raise TypeError(f"universe must be str or list[str], got {type(value).__name__}")
+        elif key == "stock_pool":
+            # 用户代码环境只校验格式不查 DB（DB 解析在 runner 侧经 PoolResolver）。
+            from backend.shared.stock_pool.strategy import validate_pool_ref_format
+
+            err = validate_pool_ref_format(value)
+            if err is not None:
+                raise ValueError(err)
+        elif key in {"start", "end"}:
+            try:
+                _coerce_date(value)
+            except Exception as e:
+                raise ValueError(f"{key} must be a date-like (YYYY-MM-DD): {e}") from e
+        elif key == "cash":
+            if not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError("cash must be a positive number")
+        elif key == "benchmark":
+            if not isinstance(value, str) or not value:
+                raise ValueError("benchmark must be non-empty string")
+        elif key in {"commission", "slippage", "tax_sell", "transfer_fee"}:
+            if not isinstance(value, (int, float)) or not (0.0 <= value < 0.1):
+                raise ValueError(f"{key} must be a float in [0, 0.1)")
+        elif key == "execution_model":
+            if value not in _ALLOWED_EXECUTION_MODELS:
+                raise ValueError(
+                    f"execution_model='{value}' not supported. "
+                    f"choose from {sorted(_ALLOWED_EXECUTION_MODELS)}"
+                )
+        elif key == "max_position_per_stock":
+            if not isinstance(value, (int, float)) or not (0.0 < value <= 1.0):
+                raise ValueError("max_position_per_stock must be in (0, 1]")
+        elif key == "max_positions":
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError("max_positions must be a positive integer")
+        elif key == "engine":
+            if value not in _ALLOWED_ENGINES:
+                raise ValueError(
+                    f"engine='{value}' not supported. v1 is {sorted(_ALLOWED_ENGINES)}"
+                )
+        elif key == "freq":
+            if value not in {"day", "30min", "5min"}:
+                raise ValueError("freq must be 'day' / '30min' / '5min'")
+
+    def assert_ready(self) -> None:
+        """Validate after setup() — required fields filled."""
+        missing = [k for k in ("universe", "start", "end", "cash") if getattr(self, k) is None]
+        if missing:
+            raise ValueError(f"setup(ctx) missing required: {missing}")
+        s = _coerce_date(self.start)
+        e = _coerce_date(self.end)
+        if s >= e:
+            raise ValueError(f"start ({self.start}) must be before end ({self.end})")
+
+    # ------------------------------------------------------------------
+    # Parameters
+    # ------------------------------------------------------------------
+    def param(
+        self,
+        name: str,
+        choices: Iterable[Any] | None = None,
+        default: Any = None,
+    ) -> Any:
+        """Declare a tunable parameter and return its current value.
+
+        First call registers the param spec. Subsequent calls just look it up
+        (so the line ``window = ctx.param('window', range(10,50,5), default=22)``
+        works both during the first sweep run and inside any rerun).
+        """
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError(f"param name '{name}' must be a valid Python identifier")
+
+        if name in self._params:
+            return self._param_values.get(name, self._params[name].default)
+
+        if choices is None:
+            choices_list: list[Any] = []
+        else:
+            choices_list = list(choices)
+        if default is None:
+            if not choices_list:
+                raise ValueError(f"param '{name}' needs either choices or a default")
+            default = choices_list[0]
+
+        spec = ParamSpec(name=name, choices=choices_list, default=default)
+        self._params[name] = spec
+        if name not in self._param_values:
+            self._param_values[name] = default
+        return self._param_values[name]
+
+    def set_param(self, name: str, value: Any) -> None:
+        """Runner uses this to inject the next sweep point."""
+        if name not in self._params:
+            raise KeyError(f"param '{name}' not declared via ctx.param()")
+        self._param_values[name] = value
+
+    @property
+    def params(self) -> dict[str, ParamSpec]:
+        return dict(self._params)
+
+    @property
+    def param_values(self) -> dict[str, Any]:
+        return dict(self._param_values)
+
+    # ------------------------------------------------------------------
+    # Data — actual fetch deferred to the data provider injected by runner.
+    # ------------------------------------------------------------------
+    def _require_provider(self) -> Any:
+        if self._data_provider is None:
+            raise RuntimeError(
+                "Data provider not attached. "
+                "(Are you running the script outside the Strategy Lab runner?)"
+            )
+        return self._data_provider
+
+    def history(
+        self,
+        symbol: str | None = None,
+        n: int = 20,
+        field: str = "close",
+        fields: Sequence[str] | None = None,
+        symbols: Sequence[str] | None = None,
+    ) -> pd.Series | pd.DataFrame:
+        provider = self._require_provider()
+        return provider.history(
+            symbol=symbol, n=n, field=field, fields=fields, symbols=symbols, today=self._today
+        )
+
+    def feature(self, symbol: str, name: str, n: int = 1) -> float | pd.Series:
+        provider = self._require_provider()
+        return provider.feature(symbol=symbol, name=name, n=n, today=self._today)
+
+    def list_features(self) -> list[str]:
+        provider = self._require_provider()
+        return provider.list_features()
+
+    def snapshot(
+        self,
+        date: Any | None = None,
+        symbols: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        provider = self._require_provider()
+        return provider.snapshot(date=date or self._today, symbols=symbols)
+
+    def benchmark_history(self, n: int = 20) -> pd.Series:
+        provider = self._require_provider()
+        return provider.benchmark_history(symbol=self.benchmark, n=n, today=self._today)
+
+    # ------------------------------------------------------------------
+    # Patterns — K 线形态识别
+    #
+    # 与市场分析 API 共用 ``backend.shared.kline_patterns``（单一事实源）：
+    # 61 种 TA-Lib 标准形态 + 9 种入场信号形态。
+    #
+    # 时点口径：判定只使用**截至 T 日收盘**的数据（provider.history 带
+    # ``today=self._today`` 截断），命中结果的 ``signal_date`` 即 T 日，
+    # **最早可成交日为 T+1 交易日**。``pattern_entry`` / ``pattern_exit``
+    # 内置 T+1 延迟下单，避免"T 日收盘信号却在 T 日收盘成交"的乐观偏差。
+    # ------------------------------------------------------------------
+    _OHLCV_FIELDS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
+
+    def _pattern_bars(self, symbol: str, lookback: int) -> pd.DataFrame | None:
+        """取形态识别所需的 OHLCV（+ 可选成交额），数据截至当前交易日。"""
+        provider = self._require_provider()
+        fields = list(self._OHLCV_FIELDS)
+        try:
+            if "amount" in (provider.list_features() or []):
+                fields.append("amount")
+        except Exception:  # noqa: BLE001 - provider 未实现 list_features 时忽略
+            pass
+
+        df: Any = None
+        for flds in (fields, list(self._OHLCV_FIELDS)):
+            try:
+                df = provider.history(
+                    symbol=symbol, n=lookback, fields=flds, today=self._today
+                )
+            except Exception:  # noqa: BLE001 - 列缺失/标的无数据时降级
+                df = None
+            if df is not None and len(df) > 0:
+                break
+        if df is None or len(df) == 0:
+            return None
+        keep = [
+            c
+            for c in ("open", "high", "low", "close", "volume", "amount")
+            if c in df.columns
+        ]
+        return df[keep].copy()
+
+    def pattern_hits(
+        self,
+        symbol: str,
+        lookback: int = 120,
+        keys: Sequence[str] | None = None,
+        include_entry: bool = True,
+        include_standard: bool = True,
+    ) -> dict[str, Any]:
+        """识别标的在当前交易日（T 日）收盘时成立的 K 线形态。
+
+        判定只使用截至 T 日收盘的数据；返回的 ``signal_date`` 即形态成立的
+        T 日，**最早可成交日为 T+1 交易日**。
+
+        Args:
+            symbol: 标的代码。
+            lookback: 回看交易日数（默认 120；MA250 类形态需传 250 以上）。
+            keys: 仅保留指定形态 key；None 表示不过滤。
+            include_entry: 是否识别 9 种入场信号形态。
+            include_standard: 是否识别 61 种 TA-Lib 标准形态。
+
+        Returns:
+            与 ``SymbolPatterns.to_dict()`` 同构的字典：
+            ``{symbol, signal_date, hits[], bullish[], bearish[], neutral[], entry_signals[]}``。
+            数据不足时返回空壳字典，不抛异常。
+        """
+        from backend.shared import kline_patterns
+
+        empty: dict[str, Any] = {
+            "symbol": symbol,
+            "signal_date": None,
+            "hits": [],
+            "bullish": [],
+            "bearish": [],
+            "neutral": [],
+            "entry_signals": [],
+        }
+        try:
+            bars = self._pattern_bars(symbol, lookback)
+        except Exception:  # noqa: BLE001 - provider 未挂载时降级为空壳
+            return empty
+        if bars is None or bars.empty:
+            return empty
+
+        try:
+            result = kline_patterns.scan_symbol(
+                symbol,
+                bars,
+                trading_dates=None,
+                include_entry=include_entry,
+                include_standard=include_standard,
+                keys=keys,
+            )
+        except Exception:  # noqa: BLE001
+            return empty
+
+        if not result.signal_date and self._today is not None:
+            result.signal_date = pd.Timestamp(self._today).strftime("%Y-%m-%d")
+        return result.to_dict()
+
+    def pattern_scan(
+        self,
+        symbols: Sequence[str] | None = None,
+        lookback: int = 120,
+        keys: Sequence[str] | None = None,
+        include_entry: bool = True,
+        include_standard: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        """批量识别：返回 ``{symbol: pattern_hits 结果}``。
+
+        ``symbols`` 为 None 时取 ``ctx.universe``（仅支持显式列表形式的股票池）。
+        """
+        if symbols:
+            targets = list(symbols)
+        elif isinstance(self.universe, (list, tuple)):
+            targets = list(self.universe)
+        else:
+            targets = []
+        out: dict[str, dict[str, Any]] = {}
+        for sym in targets:
+            out[sym] = self.pattern_hits(
+                sym,
+                lookback=lookback,
+                keys=keys,
+                include_entry=include_entry,
+                include_standard=include_standard,
+            )
+        return out
+
+    def _pattern_step(
+        self,
+        side: str,
+        symbol: str,
+        triggered: list[dict[str, Any]],
+        weight: float | None,
+        reason: str,
+        detail: dict[str, Any] | None,
+        require_flat: bool = False,
+    ) -> bool:
+        """T+1 延迟下单状态机（形态入/出场共用）。
+
+        1. **成交**：上一交易日登记的信号，在今日（T+1）提交订单；
+        2. **登记**：仅在「上次未命中 → 本次命中」（边沿触发）且满足持仓条件时
+           登记新信号，避免形态持续存在时反复下单。
+
+        Returns:
+            本次调用是否产生了下单动作。
+        """
+        pending = self._pattern_pending
+        state = self._pattern_state
+        pk = f"{side}:{symbol}"
+        today_str = (
+            pd.Timestamp(self._today).strftime("%Y-%m-%d")
+            if self._today is not None
+            else None
+        )
+        now_hit = bool(triggered)
+
+        # 1) 上一交易日登记的信号 → 今日（T+1）成交
+        filled = False
+        rec = pending.get(pk)
+        if (
+            rec is not None
+            and today_str
+            and rec.get("signal_date")
+            and rec["signal_date"] < today_str
+        ):
+            if side == "buy":
+                self.buy(
+                    symbol,
+                    weight=rec.get("weight"),
+                    reason=rec.get("reason", ""),
+                    detail=rec.get("detail") or {},
+                )
+            else:
+                self.sell(
+                    symbol,
+                    weight=rec.get("weight"),
+                    all=bool(rec.get("all", True)),
+                    reason=rec.get("reason", ""),
+                    detail=rec.get("detail") or {},
+                )
+            pending.pop(pk, None)
+            filled = True
+
+        # 2) 边沿触发：仅在「上次未命中 → 本次命中」时登记下一交易日的信号
+        was_hit = bool(state.get(pk, False))
+        if now_hit and not was_hit:
+            eligible = True
+            if require_flat:
+                eligible = self.position(symbol).qty <= 0
+            if eligible and today_str:
+                pending[pk] = {
+                    "signal_date": today_str,
+                    "weight": weight,
+                    "all": side != "buy",
+                    "reason": reason,
+                    "detail": dict(detail or {}),
+                }
+        state[pk] = now_hit
+        return filled
+
+    def pattern_entry(
+        self,
+        symbol: str,
+        weight: float = 0.5,
+        keys: Sequence[str] | None = None,
+        reason: str = "",
+        lookback: int = 120,
+        include_entry: bool = True,
+        include_standard: bool = True,
+    ) -> bool:
+        """形态信号入场（自动按 T+1 口径成交）。
+
+        - **T 日收盘**：命中指定形态 → 登记待买信号，**不在 T 日下单**；
+        - **T+1 交易日**：提交买单 → broker 以 T+1 收盘价成交。
+
+        连续调用即可：命中当天返回 ``False``（仅登记），次日返回 ``True``（已下单）。
+
+        Args:
+            symbol: 标的代码。
+            weight: 买入权重（占净值）。
+            keys: 触发形态 key；None 表示任意**入场信号形态**（9 种"入场准备标准"）。
+            reason: 订单备注。
+            lookback: 回看交易日数。
+            include_entry: 是否识别入场信号形态。
+            include_standard: 是否识别标准形态。
+
+        Returns:
+            本次调用是否产生了买入下单。
+        """
+        payload = self.pattern_hits(
+            symbol,
+            lookback=lookback,
+            keys=keys,
+            include_entry=include_entry,
+            include_standard=include_standard,
+        )
+        if keys is None:
+            triggered = [h for h in payload.get("hits", []) if h.get("category") == "entry"]
+        else:
+            wanted = set(keys)
+            triggered = [h for h in payload.get("hits", []) if h.get("key") in wanted]
+
+        detail = {
+            "signal_date": payload.get("signal_date"),
+            "patterns": [h.get("key") for h in triggered],
+            "names": [h.get("name") for h in triggered],
+        }
+        return self._pattern_step(
+            "buy",
+            symbol,
+            triggered,
+            weight,
+            reason or "pattern_entry",
+            detail,
+            require_flat=True,
+        )
+
+    def pattern_exit(
+        self,
+        symbol: str,
+        keys: Sequence[str] | None = None,
+        reason: str = "",
+        lookback: int = 120,
+        include_entry: bool = True,
+        include_standard: bool = True,
+    ) -> bool:
+        """形态信号出场（自动按 T+1 口径成交，全额清仓）。
+
+        与 :meth:`pattern_entry` 镜像：T 日命中看跌形态 → T+1 交易日清仓。
+
+        Args:
+            symbol: 标的代码。
+            keys: 触发形态 key；None 表示任意**看跌方向**形态。
+            reason: 订单备注。
+            lookback: 回看交易日数。
+            include_entry: 是否识别入场信号形态。
+            include_standard: 是否识别标准形态。
+
+        Returns:
+            本次调用是否产生了卖出下单。
+        """
+        payload = self.pattern_hits(
+            symbol,
+            lookback=lookback,
+            keys=keys,
+            include_entry=include_entry,
+            include_standard=include_standard,
+        )
+        if keys is None:
+            triggered = [
+                h for h in payload.get("hits", []) if h.get("direction") == "bearish"
+            ]
+        else:
+            wanted = set(keys)
+            triggered = [h for h in payload.get("hits", []) if h.get("key") in wanted]
+
+        detail = {
+            "signal_date": payload.get("signal_date"),
+            "patterns": [h.get("key") for h in triggered],
+            "names": [h.get("name") for h in triggered],
+        }
+        return self._pattern_step(
+            "sell", symbol, triggered, 1.0, reason or "pattern_exit", detail
+        )
+
+    # ------------------------------------------------------------------
+    # Orders — recorded; runner replays them after the hook returns.
+    # ------------------------------------------------------------------
+    def buy(
+        self,
+        symbol: str,
+        weight: float | None = None,
+        qty: int | None = None,
+        reason: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if weight is None and qty is None:
+            raise ValueError("buy() requires either weight= or qty=")
+        if weight is not None and not (0 < weight <= 1.0):
+            raise ValueError(f"weight must be in (0, 1], got {weight}")
+        if qty is not None and qty <= 0:
+            raise ValueError(f"qty must be positive, got {qty}")
+        self._orders.append(
+            OrderIntent(
+                symbol=symbol, side="buy", weight=weight, qty=qty,
+                reason=reason, detail=dict(detail or {}),
+            )
+        )
+
+    def sell(
+        self,
+        symbol: str,
+        weight: float | None = None,
+        qty: int | None = None,
+        all: bool = False,
+        reason: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if not all and weight is None and qty is None:
+            raise ValueError("sell() requires weight=, qty=, or all=True")
+        self._orders.append(
+            OrderIntent(
+                symbol=symbol, side="sell", weight=weight, qty=qty, all=all,
+                reason=reason, detail=dict(detail or {}),
+            )
+        )
+
+    def set_position(
+        self,
+        symbol: str,
+        weight: float,
+        reason: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if not (0 <= weight <= 1.0):
+            raise ValueError(f"weight must be in [0, 1], got {weight}")
+        self._orders.append(
+            OrderIntent(
+                symbol=symbol, side="set_position", weight=weight,
+                reason=reason, detail=dict(detail or {}),
+            )
+        )
+
+    def set_target_holdings(
+        self,
+        symbols: Sequence[str],
+        weight: str = "equal",
+        reason: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        if weight != "equal":
+            raise NotImplementedError("Only weight='equal' supported in v1")
+        if not isinstance(symbols, (list, tuple)):
+            raise TypeError("symbols must be list/tuple")
+        clean = [s for s in symbols if s]
+        if len(clean) > self.max_positions:
+            clean = clean[: self.max_positions]
+        self._orders.append(
+            OrderIntent(
+                symbol="*", side="set_target_holdings", targets=list(clean),
+                target_weight_mode=weight, reason=reason, detail=dict(detail or {}),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Risk
+    # ------------------------------------------------------------------
+    def set_stop_loss(self, symbol: str, pct: float) -> None:
+        if not (-0.99 < pct < 0):
+            raise ValueError(f"stop_loss pct must be in (-0.99, 0), got {pct}")
+        self._risk_rules.append(RiskRule(symbol=symbol, kind="stop_loss", value=pct))
+        if symbol in self._positions:
+            self._positions[symbol].stop_loss_pct = pct
+
+    def set_take_profit(self, symbol: str, pct: float) -> None:
+        if not (0 < pct < 10):
+            raise ValueError(f"take_profit pct must be in (0, 10), got {pct}")
+        self._risk_rules.append(RiskRule(symbol=symbol, kind="take_profit", value=pct))
+        if symbol in self._positions:
+            self._positions[symbol].take_profit_pct = pct
+
+    def set_account_stop_loss(self, pct: float) -> None:
+        if not (-0.99 < pct < 0):
+            raise ValueError(f"account_stop_loss pct must be in (-0.99, 0), got {pct}")
+        self._risk_rules.append(RiskRule(symbol=None, kind="account_stop_loss", value=pct))
+
+    def set_max_holding_days(self, symbol: str, days: int) -> None:
+        if not isinstance(days, int) or days <= 0:
+            raise ValueError("max_holding_days must be a positive int")
+        self._risk_rules.append(RiskRule(symbol=symbol, kind="max_holding_days", value=days))
+        if symbol in self._positions:
+            self._positions[symbol].max_holding_days = days
+
+    # ------------------------------------------------------------------
+    # Position queries
+    # ------------------------------------------------------------------
+    def position(self, symbol: str) -> Position:
+        return self._positions.get(symbol, Position(symbol=symbol))
+
+    def positions(self) -> pd.DataFrame:
+        if not self._positions:
+            return pd.DataFrame(
+                columns=[
+                    "symbol", "qty", "cost", "avg_cost", "market_value",
+                    "last_price", "pnl", "pnl_pct", "holding_days", "reason",
+                ]
+            )
+        rows = [p.to_dict() for p in self._positions.values() if p.qty > 0]
+        return pd.DataFrame(rows)
+
+    @property
+    def equity(self) -> float:
+        return self._equity
+
+    @property
+    def today(self) -> pd.Timestamp | None:
+        return self._today
+
+    # ------------------------------------------------------------------
+    # Tooling — log / plot / heuristics
+    # ------------------------------------------------------------------
+    def log(self, msg: Any, level: str = "info") -> None:
+        if level not in {"debug", "info", "warning", "error"}:
+            raise ValueError(f"unknown log level: {level}")
+        self._logs.append(
+            {
+                "level": level,
+                "ts": self._today.isoformat() if self._today is not None else None,
+                "msg": str(msg),
+            }
+        )
+
+    def plot_line(self, name: str, value: float, symbol: str | None = None) -> None:
+        if value is None:
+            return
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return
+        if math.isnan(v) or math.isinf(v):
+            return
+        self._plot_lines.append(
+            {
+                "name": name,
+                "symbol": symbol,
+                "ts": self._today.isoformat() if self._today is not None else None,
+                "value": v,
+            }
+        )
+
+    def plot_marker(
+        self,
+        symbol: str,
+        type: str = "alert",
+        text: str = "",
+        price: float | None = None,
+    ) -> None:
+        self._plot_markers.append(
+            {
+                "symbol": symbol,
+                "type": type,
+                "text": text,
+                "price": price,
+                "ts": self._today.isoformat() if self._today is not None else None,
+            }
+        )
+
+    def drawn_line(self, name: str, default: float | None = None) -> float | None:
+        """Read a price-level line drawn on the K-line UI.
+
+        Returns the latest price the user dropped on the chart for ``name``,
+        or ``default`` if the user has not drawn one. The runner injects values
+        via the request body (key: ``drawn_lines``); for backtests run without
+        the UI this method always returns ``default``.
+
+        Example:
+            stop = ctx.drawn_line('stop_loss', default=0.0)
+            if stop and price < stop:
+                ctx.sell(symbol, qty=100, reason='manual stop')
+        """
+        if not isinstance(name, str) or not name:
+            return default
+        v = self._drawn_lines.get(name)
+        if v is None:
+            return default
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return default
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+
+    # ------------------------------------------------------------------
+    # Helpers — wired by runner; safe stubs in tests
+    # ------------------------------------------------------------------
+    def is_st(self, symbol: str) -> bool:
+        provider = self._require_provider()
+        if hasattr(provider, "is_st"):
+            return bool(provider.is_st(symbol, today=self._today))
+        return False
+
+    def is_tradable(self, symbol: str) -> bool:
+        provider = self._require_provider()
+        if hasattr(provider, "is_tradable"):
+            return bool(provider.is_tradable(symbol, today=self._today))
+        return True
+
+    def industry(self, symbol: str) -> str:
+        provider = self._require_provider()
+        if hasattr(provider, "industry"):
+            return str(provider.industry(symbol))
+        return ""
+
+    def market_cap(self, symbol: str) -> float | None:
+        provider = self._require_provider()
+        if hasattr(provider, "market_cap"):
+            v = provider.market_cap(symbol, today=self._today)
+            return None if v is None else float(v)
+        return None
+
+    # ------------------------------------------------------------------
+    # Runner-side mutators (NOT exposed to user code)
+    # ------------------------------------------------------------------
+    def _attach(
+        self,
+        data_provider: Any,
+        broker: Any,
+        cash: float,
+    ) -> None:
+        object.__setattr__(self, "_data_provider", data_provider)
+        object.__setattr__(self, "_broker", broker)
+        object.__setattr__(self, "cash", float(cash))
+        object.__setattr__(self, "_equity", float(cash))
+
+    def _set_today(self, ts: pd.Timestamp) -> None:
+        object.__setattr__(self, "_today", ts)
+
+    def _drain_orders(self) -> list[OrderIntent]:
+        out = list(self._orders)
+        self._orders.clear()
+        return out
+
+    def _drain_risk_rules(self) -> list[RiskRule]:
+        out = list(self._risk_rules)
+        self._risk_rules.clear()
+        return out
+
+    def _set_position(self, pos: Position) -> None:
+        if pos.qty <= 0:
+            self._positions.pop(pos.symbol, None)
+        else:
+            self._positions[pos.symbol] = pos
+
+    def _update_cash_equity(self, cash: float, equity: float) -> None:
+        object.__setattr__(self, "cash", float(cash))
+        object.__setattr__(self, "_equity", float(equity))
+
+    # ------------------------------------------------------------------
+    def to_config_dict(self) -> dict[str, Any]:
+        """Serializable snapshot of setup() — used for reproducibility hash."""
+        return {k: getattr(self, k) for k in sorted(self._CONFIG_KEYS)}

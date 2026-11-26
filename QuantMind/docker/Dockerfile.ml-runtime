@@ -1,0 +1,70 @@
+FROM python:3.10-slim-bookworm
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG SKIP_PYQLIB=auto
+# torch 按需安装：skip=默认不装（离线部署省体积/时间）；cpu=本地 DL 训练；gpu=CUDA GPU 训练。
+# 本镜像作为训练镜像(quantmind-trainer)基座，torch 版本由 install-model-deps.sh 按环境补齐。
+ARG TORCH_DEVICE=skip
+ARG TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources; \
+      sed -i 's/security.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources; \
+    else \
+      sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
+      sed -i 's/security.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
+    fi
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      curl \
+      git \
+      libgomp1 \
+      swig \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/production.txt /tmp/requirements-production.txt
+COPY requirements/ai.txt /tmp/requirements-ai.txt
+
+RUN python -m pip install --upgrade pip setuptools wheel cython \
+    && python -m pip install --no-cache-dir --root-user-action=ignore -r /tmp/requirements-production.txt \
+    && if [ "${SKIP_PYQLIB}" = "1" ]; then \
+         grep -v '^pyqlib' /tmp/requirements-ai.txt > /tmp/requirements-ai-runtime.txt && \
+         python -m pip install --no-cache-dir --root-user-action=ignore -r /tmp/requirements-ai-runtime.txt; \
+       elif [ "${SKIP_PYQLIB}" = "0" ] || [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "amd64" ]; then \
+         python -m pip install --no-cache-dir --root-user-action=ignore -r /tmp/requirements-ai.txt; \
+       else \
+         grep -v '^pyqlib' /tmp/requirements-ai.txt > /tmp/requirements-ai-runtime.txt && \
+         python -m pip install --no-cache-dir --root-user-action=ignore -r /tmp/requirements-ai-runtime.txt; \
+       fi \
+    && rm -f /tmp/requirements-production.txt /tmp/requirements-ai.txt /tmp/requirements-ai-runtime.txt
+
+# torch 按 TORCH_DEVICE 安装（默认 skip）。GPU 走完整 CUDA 轮子（torch==2.9.1），
+# CPU 走 +cpu 轮子并配 CPU 专用源（传递依赖走默认 PyPI 源，避免拖慢构建）。
+RUN if [ "$TORCH_DEVICE" = "gpu" ]; then \
+      echo "=== ML runtime: 安装 GPU 版 torch（完整 CUDA）==="; \
+      python -m pip install --no-cache-dir --root-user-action=ignore "torch==2.9.1"; \
+    elif [ "$TORCH_DEVICE" = "cpu" ]; then \
+      echo "=== ML runtime: 安装 CPU 版 torch ==="; \
+      python -m pip install --no-cache-dir --root-user-action=ignore "torch==2.9.1+cpu" \
+        --index-url ${PIP_INDEX_URL} --extra-index-url ${TORCH_CPU_INDEX_URL}; \
+    else \
+      echo "=== ML runtime: 跳过 torch 安装（TORCH_DEVICE=${TORCH_DEVICE}）==="; \
+    fi
+
+RUN mkdir -p /data/models /data/qlib_data /tmp
+
+CMD ["python", "-c", "print('QuantMind ML runtime image is ready')"]

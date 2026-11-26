@@ -1,0 +1,233 @@
+import logging
+from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+
+from backend.shared.strategy_storage import get_strategy_storage_service
+from backend.shared.utils import normalize_user_id
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+class CreateItemRequest(BaseModel):
+    name: str
+    dir: str | None = None
+
+class SaveRequest(BaseModel):
+    content: str
+
+class SetRootRequest(BaseModel):
+    path: str
+
+
+class RenameRequest(BaseModel):
+    strategy_id: str | None = None
+    old_path: str | None = None
+    name: str | None = None
+    new_path: str | None = None
+
+
+def _strip_py(value: str) -> str:
+    text = value.strip()
+    if text.lower().endswith(".py"):
+        return text[:-3].strip()
+    return text
+
+def _get_user_id(request: Request) -> str:
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    raw = user.get("user_id") or user.get("sub")
+    if raw is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return str(raw)
+
+@router.post("/set-root")
+async def set_root(request: Request, body: SetRootRequest):
+    """Cloud IDE workspace root is virtual — accept and acknowledge."""
+    return {"status": "success", "current_root": body.path}
+
+
+@router.get("/list")
+async def list_files(request: Request, path: str = ""):
+    """
+    列出策略工作区。在云端模式下，每个策略记录对应一个文件。
+    """
+    try:
+        user_id = _get_user_id(request)
+        svc = get_strategy_storage_service()
+
+        # 获取用户的所有策略
+        items = svc.list(user_id=user_id)
+
+        # 将策略项映射为 IDE 文件项；过滤存量 [folder] 污染数据
+        ide_items = []
+        for s in items:
+            _nm = s.get("name") or ""
+            _tags = s.get("tags") or []
+            if _nm.startswith("[folder]") or "folder" in [str(t).lower() for t in _tags]:
+                continue
+            if (s.get("parameters") or {}).get("type") == "folder":
+                continue
+            ide_items.append({
+                "id": s["id"],
+                "name": s["name"] + ".py" if not s["name"].endswith(".py") else s["name"],
+                "path": s["id"], # 在云端，路径即 ID
+                "type": "file",
+                "size": 0, # TODO: 优化获取大小
+                "last_modified": s.get("updated_at"),
+            })
+
+        return {
+            "items": ide_items,
+            "base": "cloud_workspace",
+            "parent": None,
+            "current": "",
+        }
+    except Exception as e:
+        logger.error(f"Failed to list cloud files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/create/file")
+async def create_file(request: Request, item: CreateItemRequest):
+    try:
+        user_id = _get_user_id(request)
+        svc = get_strategy_storage_service()
+
+        # 去掉 .py 后缀作为策略名
+        name = item.name
+        if name.endswith(".py"):
+            name = name[:-3]
+
+        res = await svc.save(
+            user_id=user_id,
+            name=name,
+            code="# New Strategy\n",
+            metadata={"status": "DRAFT", "description": "Created via Cloud IDE", "dir": item.dir or ""}
+        )
+        return {"status": "success", "id": res["id"]}
+    except Exception as e:
+        logger.error(f"Failed to create cloud file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/create/folder")
+async def create_folder(request: Request, item: CreateItemRequest):
+    """创建文件夹 — 统一管理：文件夹为前端虚拟层，不再写入 strategies 表污染策略列表"""
+    name = item.name.strip("/")
+    if not name:
+        raise HTTPException(status_code=400, detail="文件夹名称不能为空")
+    # 虚拟文件夹：不落库，由前端基于策略的 dir 字段聚合展示；此处仅 ack
+    # 存量 [folder] 污染数据由 list_files 过滤，不再新增
+    return {"status": "success", "id": f"virtual-folder:{name}", "name": name, "virtual": True}
+
+
+@router.post("/rename")
+async def rename_file(request: Request, body: RenameRequest):
+    """重命名策略显示名称。云端 path 是策略编号，不能拿编号当文件名改。"""
+    user_id = _get_user_id(request)
+    sid = _strip_py(body.strategy_id or body.old_path or "")
+    raw_name = _strip_py(body.name or "")
+    if not raw_name and body.new_path:
+        raw_name = _strip_py(body.new_path.split("/")[-1])
+    if not sid or not raw_name:
+        raise HTTPException(status_code=400, detail="策略编号和名称不能为空")
+    if not sid.isdigit():
+        raise HTTPException(status_code=400, detail="无效的策略编号")
+    if len(raw_name) > 128:
+        raise HTTPException(status_code=400, detail="策略名称过长")
+
+    svc = get_strategy_storage_service()
+    updated = await svc.rename(user_id=user_id, strategy_id=sid, name=raw_name)
+    if not updated:
+        raise HTTPException(status_code=404, detail="策略不存在")
+    return {"status": "success", "id": sid, "name": raw_name}
+
+
+@router.get("/{file_id:path}")
+async def get_content(request: Request, file_id: str):
+    try:
+        user_id = _get_user_id(request)
+        svc = get_strategy_storage_service()
+
+        # 兼容带 .py 的请求
+        sid = file_id
+        if sid.endswith(".py") and "-" in sid: # UUID-like
+             sid = sid[:-3]
+
+        strategy = await svc.get(sid, user_id=user_id)
+        if not strategy:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+
+        return {"content": strategy.get("code", "")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get strategy content: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/{file_id:path}")
+async def save_content(request: Request, file_id: str, item: SaveRequest):
+    try:
+        user_id = _get_user_id(request)
+        svc = get_strategy_storage_service()
+
+        sid = file_id
+        if sid.endswith(".py"):
+            sid = sid[:-3]
+
+        # 针对 422 调试：记录请求详情
+        if not item.content:
+             logger.warning(f"Empty content received for sid={sid}")
+
+        # 先获取元数据以保留
+        try:
+            existing = await svc.get(sid, user_id=user_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch strategy {sid} before save: {e}")
+            raise HTTPException(status_code=404, detail="Strategy not found")
+
+        if not existing:
+             raise HTTPException(status_code=404, detail="Strategy not found")
+
+        await svc.save(
+            user_id=user_id,
+            strategy_id=sid,
+            name=existing["name"],
+            code=item.content,
+            metadata={
+                "description": existing.get("description"),
+                "tags": existing.get("tags"),
+                "parameters": existing.get("parameters"),
+                "is_verified": existing.get("is_verified", False)
+            }
+        )
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save strategy content: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/{file_id:path}")
+async def delete_item(request: Request, file_id: str):
+    # 虚拟文件夹删除直接成功
+    if file_id.startswith("virtual-folder:"):
+        return {"status": "success", "virtual": True}
+    try:
+        user_id = _get_user_id(request)
+        svc = get_strategy_storage_service()
+
+        sid = file_id
+        if sid.endswith(".py"):
+            sid = sid[:-3]
+
+        success = await svc.delete(sid, user_id=user_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete strategy: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

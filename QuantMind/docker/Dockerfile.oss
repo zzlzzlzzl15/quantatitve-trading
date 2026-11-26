@@ -1,0 +1,191 @@
+# QuantMind OSS Edition - Single Image
+# 构建一个镜像运行所有后端服务
+
+FROM python:3.10-slim-bookworm
+
+# 镜像源参数（构建时可传入）
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG APT_MIRROR=mirrors.aliyun.com
+
+# torch 形态选择：
+#   auto（默认，构建期动态探测，见下方 torch 层）
+#   skip -> 不安装 torch（适合镜像已含训练组件 / 纯指标行情服务）
+#   cpu  -> 强制安装 PyTorch CPU 版（构建快、镜像小）
+#   gpu  -> 强制安装完整 CUDA 版（构建慢、镜像 ~24GB，需 NVIDIA GPU）
+# 用法: docker build --build-arg TORCH_DEVICE=cpu ...
+ARG TORCH_DEVICE=auto
+# CPU 版 torch 下载源（国内 pytorch 镜像暂缺 2.9.1+cpu，使用官方源）
+ARG TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
+
+# 注意：不要设置 PIP_NO_CACHE_DIR=1，否则会禁用 pip 下载缓存，
+# 使下方 --mount=type=cache 的 wheel 缓存空转，依赖变更时全量重新下载。
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST} \
+    PYTHONPATH=/app \
+    SERVICE_MODE=all
+
+WORKDIR /app
+
+# 配置 APT 镜像源
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i "s/deb.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s/security.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list.d/debian.sources; \
+    else \
+      sed -i "s/deb.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list; \
+      sed -i "s/security.debian.org/${APT_MIRROR}/g" /etc/apt/sources.list; \
+    fi
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      curl \
+      git \
+      libgomp1 \
+      swig \
+      openssh-client \
+      rsync \
+      sshpass \
+    && rm -rf /var/lib/apt/lists/*
+
+# torch 安装层（在 requirements 之前单独成层：requirements 变更时本层命中缓存，不重装 torch）。
+#
+# TORCH_DEVICE=auto（默认）时在构建期动态探测，优先级：
+#   1. docker/torch_wheels/ 本地 wheel（离线/定制；该目录被 .gitignore 忽略、不随代码分发）
+#   2. 基础镜像已能 import torch -> 跳过（避免离线镜像重复下载、磁盘膨胀）
+#   3. 构建机能列出 GPU（nvidia-smi -L）-> 安装完整 CUDA 版
+#   4. 否则 -> 安装 CPU 版
+# 探测结论写入 /etc/quantmind/torch-device，构建日志与运行时都可复核实际形态。
+# CPU 版安装失败（如当前 pip 源缺 torch==2.9.1+cpu）时不中断构建，回落为不含 torch 并告警。
+RUN --mount=type=cache,target=/root/.cache/pip,id=quantmind-pip \
+    python -m pip install --upgrade pip setuptools wheel cython \
+    && if [ "$TORCH_DEVICE" = "skip" ] || [ "$TORCH_DEVICE" = "none" ]; then \
+         resolved=skip; \
+       elif [ "$TORCH_DEVICE" = "cpu" ] || [ "$TORCH_DEVICE" = "gpu" ]; then \
+         resolved="$TORCH_DEVICE"; \
+       elif ls /tmp/torch_wheels/*.whl >/dev/null 2>&1; then \
+         resolved=local; \
+       elif python -c "import torch" >/dev/null 2>&1; then \
+         resolved=skip; \
+       elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then \
+         resolved=gpu; \
+       else \
+         resolved=cpu; \
+       fi \
+    && echo "[torch] 形态探测：TORCH_DEVICE=${TORCH_DEVICE} -> 实际=${resolved}" \
+    && if [ "$resolved" = "skip" ]; then \
+         echo "[torch] 不安装 torch，镜像不含 PyTorch/CUDA"; \
+       elif [ "$resolved" = "local" ]; then \
+         echo "[torch] 安装本地 wheel"; \
+         python -m pip install --root-user-action=ignore /tmp/torch_wheels/*.whl; \
+         rm -rf /tmp/torch_wheels; \
+       elif [ "$resolved" = "gpu" ]; then \
+         echo "[torch] 安装 GPU 版 torch（完整 CUDA，构建慢）"; \
+         python -m pip install --root-user-action=ignore "torch==2.9.1"; \
+       else \
+         echo "[torch] 安装 CPU 版 torch（快速、无需 GPU）"; \
+         # 分两步装，避免纯 Python 依赖被拖到国外源（2026-09 实测本层 481s → 约 30s）：
+         #   1) 依赖（filelock/sympy/networkx/jinja2/fsspec；mpmath 随 sympy）走国内源；
+         #   2) torch 本体用 --no-deps 只从官方 CPU 源取（实测 19.8MB/s，约 9s）。
+         # 禁止退回「--index-url 国内 + --extra-index-url 官方源」：pip 会合并两个源的
+         # 候选，而官方 index 页把 sympy/networkx/mpmath 的链接指向 files.pythonhosted.org
+         # （国内直连约 20kB/s），正是把本层拖到 481s 的原因。
+         python -m pip install --root-user-action=ignore \
+             filelock "typing-extensions>=4.10.0" "sympy>=1.13.3" \
+             "networkx>=2.5.1" jinja2 "fsspec>=0.8.5" \
+          && python -m pip install --root-user-action=ignore --no-deps \
+             "torch==2.9.1+cpu" --index-url ${TORCH_CPU_INDEX_URL} \
+          && python -c "import torch; print('[torch] import OK:', torch.__version__)" \
+          && { python -m pip check || echo "[torch] WARN: pip check 有告警（不中断构建）"; } \
+         || { echo "[torch] WARN: CPU 版 torch 安装失败（常见原因：当前 pip 源缺依赖，或 TORCH_CPU_INDEX_URL 上没有 torch==2.9.1+cpu）"; \
+              echo "[torch] WARN: 已回落为不含 torch 的镜像；需要 torch 请设置 TORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu 后重建"; \
+              resolved=skip; }; \
+       fi \
+    && mkdir -p /etc/quantmind \
+    && printf '%s\n' "$resolved" > /etc/quantmind/torch-device \
+    && echo "[torch] 镜像实际形态已记录：/etc/quantmind/torch-device = $(cat /etc/quantmind/torch-device)"
+
+# 安装 Python 依赖
+COPY requirements.txt /tmp/requirements.txt
+COPY requirements/production.txt /tmp/requirements-production.txt
+COPY requirements/ai.txt /tmp/requirements-ai.txt
+RUN --mount=type=cache,target=/root/.cache/pip,id=quantmind-pip \
+     python -m pip install --root-user-action=ignore -r /tmp/requirements.txt \
+  && python -m pip install --root-user-action=ignore -r /tmp/requirements-production.txt \
+  && python -m pip install --root-user-action=ignore -r /tmp/requirements-ai.txt \
+  && rm -rf /tmp/requirements*.txt
+
+# 安装 QuantDB SDK（付费高质量数据源：K线/Tick/财报/估值/315维AI因子）
+RUN --mount=type=cache,target=/root/.cache/pip,id=quantmind-pip \
+    python -m pip install --root-user-action=ignore "quantdb-sdk==0.5.0"
+
+# 修复 qlib 0.9.7 bug: position.py 中 price=None 导致 TypeError
+COPY docker/patch_qlib.py /tmp/patch_qlib.py
+RUN python /tmp/patch_qlib.py && rm /tmp/patch_qlib.py
+
+# 安装 rd-agent 因子演化模块（可选，目录不存在则跳过）
+# rd-agent 在 .gitignore 中，OSS 克隆后可能不存在
+COPY docker/install_rdagent.sh /tmp/install_rdagent.sh
+# rd-agent 源码（OSS 克隆可能不存在；install 脚本会自行跳过）
+COPY rd-agent/ /app/rd-agent/
+RUN chmod +x /tmp/install_rdagent.sh && /tmp/install_rdagent.sh && rm /tmp/install_rdagent.sh
+
+# 预下载 FinBERT 中文金融情绪模型权重（~100MB，news.sentiment 惰性加载用；
+# 构建时下载到 /root/.cache/huggingface，运行时离线可用，不依赖 HF 网络）
+# 离线部署默认跳过该可选模型；运行时可在网络可用时按需下载。
+RUN HF_HUB_OFFLINE=1 python - <<'PY'
+import os, sys
+try:
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        repo_id="bardsai/finance-sentiment-zh-base",
+        local_dir_use_symlinks=False,
+    )
+    print("FinBERT 权重下载完成")
+except Exception as e:
+    print(f"FinBERT 下载跳过（构建环境无网络时不影响镜像构建）: {e}")
+PY
+
+# 复制训练脚本（确保容器内 /app/train.py 存在，避免卷挂载失败时 Docker 创建目录）
+COPY docker/training/train.py /app/train.py
+COPY docker/training/preprocessing.py /app/preprocessing.py
+COPY docker/training/parallel_utils.py /app/parallel_utils.py
+COPY docker/training/model_trainers /app/model_trainers
+
+# 复制源代码
+COPY backend backend
+COPY config config
+COPY strategy_templates strategy_templates
+
+# 创建数据目录 & Qlib 符号链接（运行时由 rd_loop_wrapper 按实际缓存路径创建）
+RUN mkdir -p /data/models /data/qlib_data /data/uploads /data/strategies /tmp \
+    && mkdir -p /root/.qlib/qlib_data
+# Qlib features 符号链接在运行时由 entrypoint 或首次访问时创建（数据卷挂载后才存在）
+
+# 依赖指纹戳（构建/打包侧经 deploy/req-fingerprint.sh 计算后以 --build-arg 注入）。
+# 供 full-deploy / update 比对「最新代码 requirements 指纹 vs 本镜像指纹」，
+# 一致→复用，不一致→重建。不传则为 unknown，视为无指纹。
+# 放在文件末尾：ARG 值变化只影响此元数据层，不会打断上方依赖层的构建缓存链
+#（真正由依赖引起的变化，本就会从对应 COPY/ARG 层开始正常失效重建）。
+ARG QM_REQ_SHA=unknown
+LABEL qm.req.sha=${QM_REQ_SHA}
+
+# 记录请求的 torch 形态（auto/cpu/gpu/skip），供 deploy/req-fingerprint.sh 的
+# --infer-torch 直接复用，无需按指纹反推；镜像内实际装了什么见 /etc/quantmind/torch-device。
+LABEL qm.torch.device=${TORCH_DEVICE}
+
+# 暴露端口
+EXPOSE 8000 8001 8002 8003
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# 启动所有服务
+CMD ["python", "backend/main_oss.py"]

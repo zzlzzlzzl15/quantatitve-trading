@@ -1,0 +1,690 @@
+"""
+QuantMind OSS Edition - Unified Service Entry Point
+单镜像运行所有后端服务
+
+服务端口分配:
+- API Gateway: 8000 (主入口)
+- Engine: 8001 (回测引擎)
+- Trade: 8002 (交易服务)
+- Stream: 8003 (实时行情)
+"""
+
+import asyncio
+import logging
+import multiprocessing as mp
+import os
+import sys
+from typing import Optional
+
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
+from backend.shared.logging_config import setup_logging
+
+setup_logging(service_name="quantmind-oss")
+logger = logging.getLogger(__name__)
+
+# 后台管理页面写入的运行时密钥（config/runtime.env），真实环境变量优先
+from backend.shared.runtime_secrets import load_runtime_env
+_runtime_loaded = load_runtime_env()
+if _runtime_loaded:
+    logger.info("Loaded %d runtime secrets from runtime.env", _runtime_loaded)
+
+# ── P0-3: 启动时强制 INTERNAL_CALL_SECRET 存在（fail-closed）──
+# 训练完成回调依赖此 secret；缺失会导致任意人都能伪造回调。
+# 生产环境直接 raise，dev/test 自动生成避免本地启动挂掉。
+import secrets as _secrets
+if not os.getenv("INTERNAL_CALL_SECRET"):
+    _env = os.getenv("QUANTMIND_ENV", "").lower()
+    if _env in ("production", "prod"):
+        raise RuntimeError(
+            "INTERNAL_CALL_SECRET must be set in production. "
+            "Set it in .env or generate with: openssl rand -hex 32"
+        )
+    _auto = _secrets.token_urlsafe(32)
+    os.environ["INTERNAL_CALL_SECRET"] = _auto
+    if _env == "development":
+        logger.warning(
+            "INTERNAL_CALL_SECRET auto-generated for development"
+        )
+    else:
+        logger.warning(
+            "INTERNAL_CALL_SECRET not set; auto-generated for local. "
+            "Set QUANTMIND_ENV=production to require explicit secret."
+        )
+
+# ── Qlib 数据目录修复 ──
+# features_real 是实际数据目录，Qlib 期望 features/
+# 通过 qlib_paths 统一解析，优先 QuantDB 缓存路径
+from backend.shared.qlib_paths import resolve_qlib_provider_uri
+_qlib_cn = resolve_qlib_provider_uri()
+if os.path.isdir(_qlib_cn):
+    _features = os.path.join(_qlib_cn, "features")
+    _features_real = os.path.join(_qlib_cn, "features_real")
+    if os.path.isdir(_features_real) and not os.path.isdir(_features):
+        os.symlink(_features_real, _features)
+        logger.info("Created symlink: %s -> %s", _features, _features_real)
+
+
+def get_workers_config() -> dict:
+    """获取各服务的 worker 数量配置"""
+    import os
+    # OSS 默认保持 engine 单 worker。
+    # 原因：AI-IDE 执行任务状态保存在进程内存中，多 worker 会导致
+    # /start 与 /execute/logs/{job_id} 命中不同进程，返回 404 Job not found。
+    default_workers = {
+        # all 模式已经在独立的 multiprocessing 子进程内运行服务；
+        # Uvicorn 再创建多 worker 会形成嵌套 spawn，导致 worker 反复退出。
+        "api": 1,
+        "engine": 1,
+        "trade": 1,
+        "stream": 1,
+    }
+    # 支持环境变量覆盖
+    return {
+        "api": int(os.getenv("API_WORKERS", default_workers["api"])),
+        "engine": int(os.getenv("ENGINE_WORKERS", default_workers["engine"])),
+        "trade": int(os.getenv("TRADE_WORKERS", default_workers["trade"])),
+        "stream": int(os.getenv("STREAM_WORKERS", default_workers["stream"])),
+    }
+
+
+def get_service_ports() -> dict:
+    """获取服务端口配置"""
+    return {
+        "api": int(os.getenv("API_PORT", "8000")),
+        "engine": int(os.getenv("ENGINE_PORT", "8001")),
+        "trade": int(os.getenv("TRADE_PORT", "8002")),
+        "stream": int(os.getenv("STREAM_PORT", "8003")),
+    }
+
+
+def run_api_service(port: int, workers: int = 1):
+    """运行 API 服务"""
+    import uvicorn
+
+    logger.info(f"Starting API service on port {port} with {workers} workers")
+    uvicorn.run(
+        "backend.services.api.main:app",
+        host="0.0.0.0",
+        port=port,
+        workers=workers,
+        access_log=False,
+    )
+
+
+def run_engine_service(port: int, workers: int = 4):
+    """运行 Engine 服务"""
+    import uvicorn
+
+    logger.info(f"Starting Engine service on port {port} with {workers} workers")
+    uvicorn.run(
+        "backend.services.engine.main:app",
+        host="0.0.0.0",
+        port=port,
+        workers=workers,
+        access_log=False,
+    )
+
+
+def run_trade_service(port: int, workers: int = 1):
+    """运行 Trade 服务"""
+    import uvicorn
+
+    logger.info(f"Starting Trade service on port {port} with {workers} workers")
+    uvicorn.run(
+        "backend.services.trade.main:app",
+        host="0.0.0.0",
+        port=port,
+        workers=workers,
+        access_log=False,
+    )
+
+
+def run_stream_service(port: int, workers: int = 1):
+    """运行 Stream 服务"""
+    import uvicorn
+
+    logger.info(f"Starting Stream service on port {port} with {workers} workers")
+    uvicorn.run(
+        "backend.services.stream.main:app",
+        host="0.0.0.0",
+        port=port,
+        workers=workers,
+        access_log=False,
+    )
+
+
+def run_single_service(service_name: str, port: int, workers: int = 1):
+    """运行单个服务（用于调试或按需启动）"""
+    service_runners = {
+        "api": run_api_service,
+        "engine": run_engine_service,
+        "trade": run_trade_service,
+        "stream": run_stream_service,
+    }
+
+    if service_name not in service_runners:
+        raise ValueError(
+            f"Unknown service: {service_name}. Available: {list(service_runners.keys())}"
+        )
+
+    service_runners[service_name](port, workers)
+
+
+def run_celery_worker():
+    """运行 Celery Worker（处理异步回测任务）"""
+    from celery import concurrency
+    from backend.services.engine.qlib_app.celery_config import celery_app
+
+    logger.info("Starting Celery Worker for async backtest tasks")
+    # 使用 solo 模式单进程执行，避免多进程复杂度
+    celery_app.worker_main([
+        "worker",
+        "--loglevel=info",
+        "--concurrency=1",
+        "--pool=solo",
+    ])
+
+
+def run_all_services():
+    """运行所有服务（多进程模式 + 子进程死亡自动重启 + 健康检查看门狗）"""
+    import time
+    import urllib.request
+    import urllib.error
+
+    ports = get_service_ports()
+    workers_config = get_workers_config()
+
+    services = [
+        ("api", run_api_service, (ports["api"], workers_config["api"])),
+        ("engine", run_engine_service, (ports["engine"], workers_config["engine"])),
+        ("trade", run_trade_service, (ports["trade"], workers_config["trade"])),
+        ("stream", run_stream_service, (ports["stream"], workers_config["stream"])),
+    ]
+    # OSS 部署有独立的 celery-worker 容器消费同一个 broker/队列。若这里再起一个内嵌
+    # worker，两者会瓜分队列消息，导致定时任务随机落在主容器内（日志与结果都不在
+    # celery 容器里），且 solo 单进程被长任务阻塞会拖垮 API 进程树。
+    # 仅在明确没有独立 worker 容器时（如单机调试）通过环境变量开启。
+    if os.getenv("EMBEDDED_CELERY_WORKER", "false").lower() == "true":
+        services.append(("celery", run_celery_worker, ()))
+
+    # name -> (runner, args, process, restart_count, last_restart_ts, health_failures)
+    state: dict = {}
+
+    def _spawn(name: str, runner, args: tuple):
+        p = mp.Process(target=runner, args=args, name=f"quantmind-{name}")
+        p.start()
+        state[name] = {
+            "runner": runner,
+            "args": args,
+            "process": p,
+            "restarts": state.get(name, {}).get("restarts", 0),
+            "last_restart": time.time(),
+            "health_failures": 0,
+        }
+        return p
+
+    for name, runner, args in services:
+        p = _spawn(name, runner, args)
+        if name == "celery":
+            logger.info(f"Started celery worker (PID: {p.pid})")
+        else:
+            port, workers = args
+            logger.info(f"Started {name} service (PID: {p.pid}) on port {port} with {workers} workers")
+
+    logger.info("=" * 60)
+    logger.info("QuantMind OSS Edition - All services started")
+    logger.info(f"  API Gateway:  http://localhost:{ports['api']}")
+    logger.info(f"  Engine:       http://localhost:{ports['engine']}")
+    logger.info(f"  Trade:        http://localhost:{ports['trade']}")
+    logger.info(f"  Stream:       http://localhost:{ports['stream']}")
+    logger.info("=" * 60)
+
+    # Supervision loop: detect dead/zombie children and respawn with exponential-backoff cap
+    MAX_RESTARTS_PER_WINDOW = 5
+    RESTART_WINDOW_SEC = 300  # 5 min sliding window
+    HEALTH_CHECK_INTERVAL = 30  # seconds between health checks
+    HEALTH_TIMEOUT = 10  # seconds to wait for health response
+    MAX_HEALTH_FAILURES = 3  # consecutive failures before restart
+    SHUTTING_DOWN = False
+    last_health_check = time.time()
+    startup_grace_sec = 180  # skip health checks during initial startup (allow DuckDB/Qlib initialization)
+
+    def _check_service_health(name: str, port: int) -> bool:
+        """Check if a service responds to /health. Returns True if healthy."""
+        try:
+            url = f"http://127.0.0.1:{port}/health"
+            req = urllib.request.Request(url, method="GET")
+            resp = urllib.request.urlopen(req, timeout=HEALTH_TIMEOUT)
+            return resp.status == 200
+        except Exception:
+            return False
+
+    def _restart_service(name: str, info: dict, reason: str):
+        """Kill and restart a service."""
+        p = info["process"]
+        logger.error(f"🔴 {name} service {reason}, restarting...")
+        try:
+            p.terminate()
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2)
+        except Exception:
+            pass
+
+        now = time.time()
+        if now - info["last_restart"] > RESTART_WINDOW_SEC:
+            info["restarts"] = 0
+
+        if info["restarts"] >= MAX_RESTARTS_PER_WINDOW:
+            logger.error(
+                f"⛔ {name} crashed too many times "
+                f"({info['restarts']}/{MAX_RESTARTS_PER_WINDOW} in {RESTART_WINDOW_SEC}s), "
+                f"not restarting. Manual intervention required."
+            )
+            return
+
+        info["restarts"] += 1
+        new_p = _spawn(name, info["runner"], info["args"])
+        state[name]["restarts"] = info["restarts"]
+        logger.info(f"♻️  Restarted {name} service (new PID: {new_p.pid})")
+
+    try:
+        while not SHUTTING_DOWN:
+            time.sleep(3)
+            now = time.time()
+
+            for name, info in list(state.items()):
+                p = info["process"]
+                # exitcode is None while alive; set when child exits (even zombie reaped here)
+                if not p.is_alive() or p.exitcode is not None:
+                    exit_code = p.exitcode
+                    try:
+                        p.join(timeout=1)
+                    except Exception:
+                        pass
+
+                    if now - info["last_restart"] > RESTART_WINDOW_SEC:
+                        info["restarts"] = 0
+
+                    if info["restarts"] >= MAX_RESTARTS_PER_WINDOW:
+                        logger.error(
+                            f"⛔ {name} crashed too many times "
+                            f"({info['restarts']}/{MAX_RESTARTS_PER_WINDOW} in {RESTART_WINDOW_SEC}s), "
+                            f"not restarting. Manual intervention required."
+                        )
+                        continue
+
+                    info["restarts"] += 1
+                    logger.error(
+                        f"⚠️  {name} service died (exitcode={exit_code}), "
+                        f"respawning [attempt {info['restarts']}/{MAX_RESTARTS_PER_WINDOW}]..."
+                    )
+                    new_p = _spawn(name, info["runner"], info["args"])
+                    state[name]["restarts"] = info["restarts"]
+                    logger.info(f"♻️  Restarted {name} service (new PID: {new_p.pid})")
+
+            # Health check watchdog (runs every HEALTH_CHECK_INTERVAL seconds, after startup grace)
+            if now - last_health_check >= HEALTH_CHECK_INTERVAL and (now - state[list(state.keys())[0]]["last_restart"]) > startup_grace_sec:
+                last_health_check = now
+                for name, info in list(state.items()):
+                    if name == "celery":
+                        continue  # celery has no HTTP health endpoint
+                    p = info["process"]
+                    if not p.is_alive():
+                        continue  # already handled by dead-process logic above
+
+                    port_key = name
+                    port = ports.get(port_key)
+                    if not port:
+                        continue
+
+                    if _check_service_health(name, port):
+                        if info.get("health_failures", 0) > 0:
+                            logger.info(f"✅ {name} service recovered (port {port})")
+                        info["health_failures"] = 0
+                    else:
+                        info["health_failures"] = info.get("health_failures", 0) + 1
+                        logger.warning(
+                            f"⚠️  {name} health check failed "
+                            f"({info['health_failures']}/{MAX_HEALTH_FAILURES})"
+                        )
+                        if info["health_failures"] >= MAX_HEALTH_FAILURES:
+                            _restart_service(name, info, "unresponsive to health checks")
+    except KeyboardInterrupt:
+        SHUTTING_DOWN = True
+        logger.info("Shutting down all services...")
+        for name, info in state.items():
+            p = info["process"]
+            if p.is_alive():
+                p.terminate()
+                logger.info(f"Terminated {name} service")
+
+        for name, info in state.items():
+            p = info["process"]
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                logger.warning(f"Force killed {name} service")
+
+
+def _ensure_database_schema():
+    """启动前自动检测并创建缺失的数据库表。
+
+    对于新部署（空库），确保所有业务表存在，避免 'relation does not exist' 错误。
+    使用 CREATE TABLE IF NOT EXISTS 保证幂等，不会影响已有数据。
+    """
+    import subprocess
+
+    init_sql = "/app/backend/shared/db_init.sql"
+    if not os.path.isfile(init_sql):
+        logger.warning("数据库初始化 SQL 未找到: %s，跳过自动建表", init_sql)
+        return
+
+    db_host = os.getenv("DB_HOST", os.getenv("POSTGRES_HOST", "db"))
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", os.getenv("POSTGRES_DB", "quantmind"))
+    db_user = os.getenv("DB_USER", os.getenv("POSTGRES_USER", "quantmind"))
+    db_password = os.getenv("DB_PASSWORD", os.getenv("POSTGRES_PASSWORD", "quantmind2026"))
+
+    env = os.environ.copy()
+    env["PGPASSWORD"] = db_password
+
+    try:
+        result = subprocess.run(
+            ["psql", "-h", db_host, "-p", db_port, "-U", db_user, "-d", db_name,
+             "-f", init_sql, "--quiet", "-v", "ON_ERROR_STOP=0"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            logger.info("数据库表结构自检完成")
+        else:
+            # 部分表可能已存在，返回非零但无碍
+            logger.warning("数据库初始化有警告（可忽略，表可能已存在）: %s",
+                           result.stderr[:200] if result.stderr else "")
+        # 执行市场分析模块建表（qm_market_sectors 等，不在 db_init.sql 内）
+        _ensure_market_analysis_tables(env)
+        # 执行增量升级脚本（system_events、news title 等，不在 db_init.sql 内，幂等可重放）
+        _ensure_upgrade_scripts(env)
+    except FileNotFoundError:
+        # psql 客户端可能未安装在镜像中，回退到 Python 方式
+        logger.info("psql 未安装，使用 Python 执行数据库初始化")
+        _ensure_database_schema_python()
+    except Exception as e:
+        logger.warning("数据库自动建表失败（不影响启动，后续按需建表）: %s", e)
+
+
+def _upgrade_script_paths() -> list[str]:
+    """未来增量补丁 SQL 的候选路径（按文件名去重、按版本号排序）。
+
+    历史补丁 v1.0.1 ~ v1.0.8 已合并进 backend/shared/db_init.sql 第 66 节
+    （存量库收敛），data/upgrade_v1.0.*.sql 不再维护。这里保留扫描能力，
+    供后续新增的 data/upgrade_vX.Y.Z.sql 使用。
+
+    /app/data 是历史路径（容器里常是 uploads）；compose 把仓库 data/ 挂到 /data。
+    再扫仓库相对路径，避免本地直接跑 main_oss 时漏脚本。
+    """
+    import glob as _glob
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_data = os.path.abspath(os.path.join(here, "..", "data"))
+    seen: set[str] = set()
+    out: list[str] = []
+    for pattern in (
+        "/app/data/upgrade_*.sql",
+        "/data/upgrade_*.sql",
+        os.path.join(repo_data, "upgrade_*.sql"),
+    ):
+        for sql_path in sorted(_glob.glob(pattern)):
+            name = os.path.basename(sql_path)
+            if name not in seen:
+                seen.add(name)
+                out.append(sql_path)
+    return sorted(
+        out,
+        key=lambda path: tuple(
+            (0, int(part)) if part.isdigit() else (1, part)
+            for part in re.split(r"(\d+)", os.path.basename(path))
+        ),
+    )
+
+
+def _ensure_upgrade_scripts(env: dict) -> None:
+    """执行 /app/data/upgrade_*.sql 增量迁移。
+
+    v1.0.1 ~ v1.0.8 已合并进 db_init.sql 第 66 节，随主初始化一起幂等重放，
+    此处只处理后续新增补丁；新库第一次部署也不会因此缺表缺列。
+    """
+    import glob as _glob
+    import subprocess as _sp
+
+    for sql_path in _upgrade_script_paths():
+        try:
+            result = _sp.run(
+                ["psql", "-h", os.getenv("DB_HOST", os.getenv("POSTGRES_HOST", "db")),
+                 "-p", os.getenv("DB_PORT", "5432"),
+                 "-U", os.getenv("DB_USER", os.getenv("POSTGRES_USER", "quantmind")),
+                 "-d", os.getenv("DB_NAME", os.getenv("POSTGRES_DB", "quantmind")),
+                 "-f", sql_path, "--quiet", "-v", "ON_ERROR_STOP=1"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                logger.info("增量升级已执行: %s", os.path.basename(sql_path))
+            else:
+                logger.warning("增量升级有警告 %s: %s", os.path.basename(sql_path), (result.stderr or "")[:200])
+        except FileNotFoundError:
+            _ensure_upgrade_scripts_python(sql_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("增量升级失败 %s: %s", os.path.basename(sql_path), e)
+
+
+def _ensure_upgrade_scripts_python(sql_path: str) -> None:
+    """psql 不可用时的回退：用 psycopg2 直接执行 SQL 文件。"""
+    db_host = os.getenv("DB_HOST", os.getenv("POSTGRES_HOST", "db"))
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", os.getenv("POSTGRES_DB", "quantmind"))
+    db_user = os.getenv("DB_USER", os.getenv("POSTGRES_USER", "quantmind"))
+    db_password = os.getenv("DB_PASSWORD", os.getenv("POSTGRES_PASSWORD", "quantmind2026"))
+    conn = None
+    try:
+        import psycopg2  # type: ignore
+        sql_text = open(sql_path, encoding="utf-8").read()
+        conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name, user=db_user, password=db_password)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(sql_text)
+        logger.info("增量升级已执行(Python): %s", os.path.basename(sql_path))
+    except Exception as e:  # noqa: BLE001
+        if conn is not None:
+            with conn.cursor() as rollback_cur:
+                rollback_cur.execute("ROLLBACK")
+        logger.warning("增量升级失败(Python) %s: %s", os.path.basename(sql_path), e)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _ensure_market_analysis_tables(env: dict) -> None:
+    """执行市场分析模块的建表 SQL（qm_market_sectors / qm_sector_constituents 等）。
+
+    db_init.sql 不含这些表，须额外执行 market_analysis/migrations 下的 SQL。
+    """
+    import subprocess
+
+    migration_sql = "/app/backend/services/api/market_analysis/migrations/001_create_market_analysis.sql"
+    if not os.path.isfile(migration_sql):
+        logger.debug("市场分析建表 SQL 未找到: %s", migration_sql)
+        return
+    db_host = os.getenv("DB_HOST", os.getenv("POSTGRES_HOST", "db"))
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", os.getenv("POSTGRES_DB", "quantmind"))
+    db_user = os.getenv("DB_USER", os.getenv("POSTGRES_USER", "quantmind"))
+    try:
+        result = subprocess.run(
+            ["psql", "-h", db_host, "-p", db_port, "-U", db_user, "-d", db_name,
+             "-f", migration_sql, "--quiet", "-v", "ON_ERROR_STOP=0"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            logger.info("市场分析表结构自检完成")
+        else:
+            logger.warning("市场分析建表有警告（可忽略）: %s",
+                           result.stderr[:200] if result.stderr else "")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("市场分析建表失败（不影响启动）: %s", e)
+
+
+def _ensure_database_schema_python():
+    """psql 不可用时的回退方案：用 Python psycopg2 执行初始化 SQL。"""
+    init_sql = "/app/backend/shared/db_init.sql"
+    if not os.path.isfile(init_sql):
+        return
+
+    db_host = os.getenv("DB_HOST", os.getenv("POSTGRES_HOST", "db"))
+    db_port = os.getenv("DB_PORT", "5432")
+    db_name = os.getenv("DB_NAME", os.getenv("POSTGRES_DB", "quantmind"))
+    db_user = os.getenv("DB_USER", os.getenv("POSTGRES_USER", "quantmind"))
+    db_password = os.getenv("DB_PASSWORD", os.getenv("POSTGRES_PASSWORD", "quantmind2026"))
+
+    conn = None
+    try:
+        import psycopg2
+        conn = psycopg2.connect(host=db_host, port=db_port, dbname=db_name,
+                                user=db_user, password=db_password)
+        conn.autocommit = True
+        with open(init_sql) as f:
+            sql = f.read()
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            # 市场分析建表（qm_market_sectors 等，不在 db_init.sql 内）
+            market_sql = "/app/backend/services/api/market_analysis/migrations/001_create_market_analysis.sql"
+            if os.path.isfile(market_sql):
+                with open(market_sql) as f:
+                    cur.execute(f.read())
+                logger.info("市场分析表结构自检完成 (Python psycopg2)")
+            # 增量升级（system_events、news title 等，幂等）
+            for _up in _upgrade_script_paths():
+                try:
+                    with open(_up, encoding="utf-8") as f:
+                        cur.execute(f.read())
+                    logger.info("增量升级已执行(Python): %s", os.path.basename(_up))
+                except Exception as ue:  # noqa: BLE001
+                    # 文件可含 BEGIN/COMMIT。autocommit=True 下 conn.rollback()
+                    # 可能是空操作；用显式 SQL 结束失败事务，隔离后续升级。
+                    cur.execute("ROLLBACK")
+                    logger.warning("增量升级失败(Python) %s: %s", os.path.basename(_up), ue)
+        logger.info("数据库表结构自检完成 (Python psycopg2)")
+    except Exception as e:
+        if conn is not None:
+            with conn.cursor() as rollback_cur:
+                rollback_cur.execute("ROLLBACK")
+        logger.warning("数据库自动建表失败（不影响启动）: %s", e)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _ensure_seed_admin():
+    """启动期确保默认管理员账号存在（自愈）。
+
+    离线部署的 postgres 转储不含 admin 用户，且历史上应用启动不会自动 seed，
+    导致首次登录报 'user not found' (401)。这里在启动期幂等地创建默认 admin
+    （admin / admin123，user_id=10000001，is_admin=true，显示名 QuantMind、头像 /logo.png），
+    并补全 RBAC 角色。
+    失败仅告警，不影响主流程启动。
+    """
+    try:
+        import asyncio
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        # 触发 user_app 模型（users / roles / permissions 等）注册到 Base.metadata
+        from backend.services.api.user_app.models.user import Base, User  # noqa: F401
+        from backend.services.api.user_app.models import rbac  # noqa: F401
+        from backend.services.api.user_app.services.seed_data import init_admin_data
+
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            logger.warning("DATABASE_URL 未设置，跳过默认管理员 seed")
+            return
+
+        engine = create_async_engine(db_url)
+        async_session = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def _run():
+            # 幂等建表：确保 users / roles / permissions / user_roles 等存在
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            async with async_session() as session:
+                await init_admin_data(session)
+            await engine.dispose()
+
+        asyncio.run(_run())
+        logger.info("默认管理员账号 seed 完成")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "默认管理员 seed 失败（不影响启动，可手动执行 seed_data.py）: %s", e
+        )
+
+
+def _ensure_stock_pool() -> None:
+    """启动期确保股票池表结构 + 内置池 seed + 成分 TXT 刷新（幂等，失败仅告警）。
+
+    全局股票池是回测 / 训练 / 推理 / 模拟盘 / 实盘共用的唯一事实源；
+    成员为前缀式 TXT（/data/stock_pool/<code>.txt），保存即生效。
+    """
+    try:
+        from backend.shared.stock_pool import (
+            pool_storage_ready,
+            refresh_builtin_txts_sync,
+            seed_builtin_pools_sync,
+        )
+
+        pool_storage_ready()
+        seed_builtin_pools_sync()
+        refresh_builtin_txts_sync()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("全局股票池初始化失败（不影响启动）: %s", e)
+
+
+def main():
+    """主入口"""
+    # 启动前确保数据库表结构完整
+    _ensure_database_schema()
+    # 启动期确保默认管理员账号存在（幂等，失败不影响启动）
+    _ensure_seed_admin()
+    # 启动期确保全局股票池表结构与内置池 seed（幂等，失败不影响启动）
+    _ensure_stock_pool()
+
+    service_mode = os.getenv("SERVICE_MODE", "all").lower().strip()
+    ports = get_service_ports()
+    workers_config = get_workers_config()
+
+    logger.info(f"QuantMind OSS Edition - Service Mode: {service_mode}")
+
+    if service_mode == "all":
+        run_all_services()
+    elif service_mode in ("api", "engine", "trade", "stream"):
+        run_single_service(service_mode, ports[service_mode], workers_config[service_mode])
+    else:
+        logger.error(f"Unknown SERVICE_MODE: {service_mode}")
+        logger.info("Valid modes: all, api, engine, trade, stream")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

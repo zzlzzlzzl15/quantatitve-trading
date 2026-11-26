@@ -1,0 +1,23 @@
+{
+  "id": "adaptive_drift",
+  "name": "自适应动态调仓策略 (Concept Drift)",
+  "description": "模型信号 Top-K 选股，宽选股宽度与灵活换手，应对风格漂移。",
+  "category": "basic",
+  "difficulty": "intermediate",
+  "params": [
+    {
+      "name": "topk",
+      "description": "基准选股数量",
+      "default": 50,
+      "min": 10,
+      "max": 100
+    }
+  ],
+  "execution_defaults": {},
+  "live_defaults": {
+    "rebalance_days": 3
+  },
+  "live_config_tips": [],
+  "dir": "通用策略",
+  "markets": []
+}

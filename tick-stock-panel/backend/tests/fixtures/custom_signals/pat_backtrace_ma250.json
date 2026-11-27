@@ -1,0 +1,24 @@
+{
+  "id": "pat_backtrace_ma250",
+  "name": "形态-回踩年线",
+  "kind": "entry",
+  "timeframe": "daily",
+  "enabled": true,
+  "conditions": [
+    {
+      "left": "pat_backtrace_ma250",
+      "op": "==",
+      "right": "1",
+      "leftDays": 0,
+      "rightDays": 0
+    },
+    {
+      "left": "pat_backtrace_ma250",
+      "op": "==",
+      "right": "0",
+      "leftDays": 1,
+      "rightDays": 0
+    }
+  ],
+  "column": "signal_pat_backtrace_ma250"
+}

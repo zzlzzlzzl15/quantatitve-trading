@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"
+     role="img" aria-label="Tick Stock Panel">
+  <defs>
+    <linearGradient id="tsp-tile-light" x1="8.5" y1="32" x2="55.5" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A78BFA"/>
+      <stop offset=".5" stop-color="#8B5CF6"/>
+      <stop offset="1" stop-color="#6D28D9"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="8" fill="#F6F6F8"/>
+  <g transform="translate(8 8) scale(.75)">
+    <path fill="url(#tsp-tile-light)" d="M8.5 32.5C8.5 19.25 15.75 10.5 27.5 10.5H35.875L29.875 16.5V21.5H26.125V40H29.875V46.5L20.875 55.5H8.5Z"/>
+    <path fill="url(#tsp-tile-light)" d="M34.125 17.5L43.125 8.5H55.5V31.5C55.5 44.75 48.25 53.5 36.5 53.5H28.125L34.125 47.5V40H37.875V21.5H34.125Z"/>
+  </g>
+</svg>

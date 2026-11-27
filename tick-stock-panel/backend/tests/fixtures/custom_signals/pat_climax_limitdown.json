@@ -1,0 +1,24 @@
+{
+  "id": "pat_climax_limitdown",
+  "name": "形态-放量跌停",
+  "kind": "entry",
+  "timeframe": "daily",
+  "enabled": true,
+  "conditions": [
+    {
+      "left": "pat_climax_limitdown",
+      "op": "==",
+      "right": "1",
+      "leftDays": 0,
+      "rightDays": 0
+    },
+    {
+      "left": "pat_climax_limitdown",
+      "op": "==",
+      "right": "0",
+      "leftDays": 1,
+      "rightDays": 0
+    }
+  ],
+  "column": "signal_pat_climax_limitdown"
+}
